@@ -1,0 +1,13 @@
+{
+  "name": "test_writer",
+  "display_name": "Test Writer Skill",
+  "description": "理解现有测试风格，为指定行为补充覆盖并运行验证。",
+  "keywords": ["补测试", "添加测试", "测试覆盖", "单元测试", "test coverage", "write tests"],
+  "allowed_tools": ["list_files", "read_file", "search_text", "apply_patch", "run_command", "finish"],
+  "plan": [
+    {"id": "inspect", "title": "理解功能与现有测试风格", "status": "running"},
+    {"id": "diagnose", "title": "确定需要覆盖的行为", "status": "pending"},
+    {"id": "edit", "title": "添加聚焦的测试用例", "status": "pending"},
+    {"id": "verify", "title": "运行完整测试验证", "status": "pending"}
+  ]
+}

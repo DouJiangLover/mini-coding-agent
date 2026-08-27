@@ -1,0 +1,13 @@
+{
+  "name": "bug_fix",
+  "display_name": "Bug Fix Skill",
+  "description": "根据报错和失败测试定位根因，以最小改动修复并重新验证。",
+  "keywords": ["修复", "bug", "报错", "错误", "失败", "pytest", "test failed", "error"],
+  "allowed_tools": ["list_files", "read_file", "search_text", "apply_patch", "run_command", "finish"],
+  "plan": [
+    {"id": "inspect", "title": "理解项目结构与任务约束", "status": "running"},
+    {"id": "diagnose", "title": "复现问题并定位根因", "status": "pending"},
+    {"id": "edit", "title": "实施最小范围修改", "status": "pending"},
+    {"id": "verify", "title": "重新运行测试验证", "status": "pending"}
+  ]
+}

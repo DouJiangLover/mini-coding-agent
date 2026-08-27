@@ -1,0 +1,13 @@
+{
+  "name": "documentation",
+  "display_name": "Documentation Skill",
+  "description": "从真实项目结构和配置生成准确、可执行的使用文档。",
+  "keywords": ["readme", "文档", "使用说明", "介绍", "documentation"],
+  "allowed_tools": ["list_files", "read_file", "search_text", "apply_patch", "run_command", "finish"],
+  "plan": [
+    {"id": "inspect", "title": "分析项目结构和入口", "status": "running"},
+    {"id": "diagnose", "title": "核对安装与运行方式", "status": "pending"},
+    {"id": "edit", "title": "编写准确的项目文档", "status": "pending"},
+    {"id": "verify", "title": "检查命令和内容完整性", "status": "pending"}
+  ]
+}
