@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import uuid
 from pathlib import Path
 from typing import AsyncIterator
@@ -54,7 +55,12 @@ class CreateRunRequest(BaseModel):
 
 @app.get("/api/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "mode": model.mode_name}
+    return {
+        "status": "ok",
+        "mode": model.mode_name,
+        "provider": model.provider_name,
+        "model": model.model_name,
+    }
 
 
 @app.post("/api/runs", status_code=202)
@@ -120,11 +126,36 @@ async def cancel_run(run_id: str) -> dict[str, str]:
 
 
 @app.post("/api/demo/reset")
-async def reset_demo() -> dict[str, str]:
-    demo_workspace = resolve_workspace(PROJECT_ROOT, "examples/calculator")
-    source = demo_workspace / "src" / "calculator.py"
-    source.write_text(DEMO_BUGGY_SOURCE, encoding="utf-8")
-    return {"status": "reset", "workspace": "examples/calculator"}
+async def reset_demo(workspace: str = "examples/calculator") -> dict[str, str]:
+    if runs.has_active_workspace(workspace):
+        raise HTTPException(status_code=409, detail="该工作区仍有 Agent 任务运行，请先停止任务再重置")
+    if workspace == "examples/calculator":
+        demo_workspace = resolve_workspace(PROJECT_ROOT, workspace)
+        source = demo_workspace / "src" / "calculator.py"
+        source.write_text(DEMO_BUGGY_SOURCE, encoding="utf-8")
+    elif workspace == "examples/star-catcher":
+        demo_workspace = resolve_workspace(PROJECT_ROOT, workspace)
+        source = demo_workspace / "src" / "game.js"
+        content = source.read_text(encoding="utf-8")
+        if STAR_CATCHER_FIXED_BLOCK in content:
+            source.write_text(content.replace(STAR_CATCHER_FIXED_BLOCK, STAR_CATCHER_BUGGY_BLOCK, 1), encoding="utf-8")
+        elif STAR_CATCHER_BUGGY_BLOCK not in content:
+            raise HTTPException(status_code=409, detail="游戏逻辑已发生其他修改，无法安全恢复故障")
+    elif workspace == "examples/2048-game":
+        demo_workspace = resolve_workspace(PROJECT_ROOT, workspace)
+        requirements = demo_workspace / "REQUIREMENTS.md"
+        if not requirements.is_file():
+            raise HTTPException(status_code=409, detail="2048 需求文档不存在，无法安全重置")
+        generated_entries = [entry for entry in demo_workspace.iterdir() if entry.name != requirements.name]
+        if generated_entries:
+            backup_id = f"2048-{uuid.uuid4().hex[:10]}"
+            backup_root = PROJECT_ROOT / ".tracecoder" / "reset-backups" / backup_id
+            backup_root.mkdir(parents=True, exist_ok=False)
+            for entry in generated_entries:
+                shutil.move(str(entry), str(backup_root / entry.name))
+    else:
+        raise HTTPException(status_code=400, detail="仅支持重置内置演示项目")
+    return {"status": "reset", "workspace": workspace}
 
 
 DEMO_BUGGY_SOURCE = '''"""Small calculator used by the TraceCoder demo."""
@@ -138,4 +169,14 @@ def add(a: float, b: float) -> float:
 def subtract(a: float, b: float) -> float:
     """Return the difference of two numbers."""
     return a - b
+'''
+
+STAR_CATCHER_BUGGY_BLOCK = '''    score: state.score + gainedScore,
+    combo: 0,
+    bestCombo: Math.max(state.bestCombo, nextCombo),
+'''
+
+STAR_CATCHER_FIXED_BLOCK = '''    score: state.score + gainedScore,
+    combo: nextCombo,
+    bestCombo: Math.max(state.bestCombo, nextCombo),
 '''

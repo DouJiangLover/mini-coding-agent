@@ -1,4 +1,5 @@
 import asyncio
+import shutil
 from pathlib import Path
 
 from backend.agent.loop import AgentLoop
@@ -9,6 +10,7 @@ from backend.state import RunRecord
 
 
 SKILLS_ROOT = Path(__file__).resolve().parents[1] / "skills"
+EXAMPLES_ROOT = Path(__file__).resolve().parents[1] / "examples"
 
 
 def test_demo_agent_repairs_and_verifies_project(tmp_path: Path):
@@ -38,3 +40,19 @@ def test_demo_agent_repairs_and_verifies_project(tmp_path: Path):
     plan_events = [event for event in event_store.get("run_test").events if event["type"] == "plan_updated"]
     assert plan_events[0]["payload"]["items"][0]["status"] == "running"
     assert plan_events[-1]["payload"]["items"][-1]["status"] == "success"
+
+
+def test_demo_agent_repairs_star_catcher_combo(tmp_path: Path):
+    workspace = tmp_path / "star-catcher"
+    shutil.copytree(EXAMPLES_ROOT / "star-catcher", workspace)
+    event_store = EventStore(tmp_path / "events")
+    event_store.create("run_game")
+    record = RunRecord("run_game", "修复当前工作区中失败的测试", "star-catcher")
+    loop = AgentLoop(event_store, SkillRouter(SKILLS_ROOT), DemoModelClient(), max_steps=10)
+
+    asyncio.run(loop.run(record, workspace))
+
+    assert record.status == "completed"
+    assert "combo: nextCombo" in (workspace / "src" / "game.js").read_text(encoding="utf-8")
+    assert record.successful_commands == ["npm test"]
+    assert event_store.get("run_game").terminal

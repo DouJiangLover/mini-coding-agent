@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="一个用于 Coding Agent 修复演示的星星点击小游戏。" />
+    <title>星星捕手</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="game-shell">
+      <section class="game-card" aria-labelledby="game-title">
+        <header class="game-header">
+          <div>
+            <p class="eyebrow">MINI ARCADE</p>
+            <h1 id="game-title">星星捕手</h1>
+            <p>20 秒内尽可能多地接住星星，连续命中可获得额外分数。</p>
+          </div>
+          <button id="start-button" class="start-button" type="button">开始游戏</button>
+        </header>
+
+        <div class="scoreboard" aria-label="游戏数据">
+          <div><span>得分</span><strong id="score">0</strong></div>
+          <div><span>连击</span><strong id="combo">0</strong></div>
+          <div><span>最高连击</span><strong id="best-combo">0</strong></div>
+          <div><span>剩余时间</span><strong><b id="time">20</b>s</strong></div>
+        </div>
+
+        <div id="arena" class="arena" aria-label="游戏区域">
+          <div class="arena-grid" aria-hidden="true"></div>
+          <button id="target" class="target" type="button" aria-label="点击星星" disabled>
+            <span aria-hidden="true">★</span>
+          </button>
+          <div id="empty-state" class="empty-state">
+            <span aria-hidden="true">✦</span>
+            <strong>准备好了吗？</strong>
+            <small>点击“开始游戏”，然后追上每一颗星星。</small>
+          </div>
+        </div>
+
+        <footer class="game-footer">
+          <span id="status" role="status">等待开始</span>
+          <span>点到空白区域会中断连击</span>
+        </footer>
+      </section>
+    </main>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

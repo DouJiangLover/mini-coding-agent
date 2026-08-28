@@ -17,3 +17,10 @@ def test_router_selects_documentation_skill():
     match = SkillRouter(SKILLS_ROOT).select("为项目编写 README 使用文档")
 
     assert match.skill.name == "documentation"
+
+
+def test_router_selects_frontend_build_skill():
+    match = SkillRouter(SKILLS_ROOT).select("请根据需求文档从零实现一个 2048 小游戏")
+
+    assert match.skill.name == "frontend_build"
+    assert "2048" in match.matched_keywords

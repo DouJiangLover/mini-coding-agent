@@ -26,6 +26,8 @@ class ModelTurn:
 
 class ModelClient(Protocol):
     mode_name: str
+    provider_name: str
+    model_name: str
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
         ...
@@ -34,10 +36,12 @@ class ModelClient(Protocol):
 class OpenAICompatibleClient:
     mode_name = "model"
 
-    def __init__(self, api_key: str, base_url: str, model: str) -> None:
+    def __init__(self, api_key: str, base_url: str, model: str, provider: str = "openai-compatible") -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.provider_name = provider
+        self.model_name = model
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
         payload = {
@@ -47,6 +51,10 @@ class OpenAICompatibleClient:
             "tool_choice": "auto",
             "temperature": 0.1,
         }
+        if self.provider_name == "deepseek":
+            # DeepSeek V4 enables thinking by default. Non-thinking mode keeps
+            # the tool loop OpenAI-compatible without reasoning_content state.
+            payload["thinking"] = {"type": "disabled"}
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=20.0)) as client:
             response = await client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
@@ -87,9 +95,21 @@ class DemoModelClient:
     """
 
     mode_name = "demo"
+    provider_name = "local-demo"
+    model_name = "deterministic-demo"
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
         history = [message for message in messages if message.get("role") == "tool"]
+        task_text = "\n".join(
+            str(message.get("content") or "")
+            for message in messages
+            if message.get("role") == "user"
+        ).lower()
+        history_text = "\n".join(str(message.get("content") or "") for message in history).lower()
+        is_star_workspace = all(marker in history_text for marker in ("package.json", "game.js", "game.test.js"))
+        if "星星捕手" in task_text or "star-catcher" in task_text or "combo" in task_text or is_star_workspace:
+            return self._complete_star_catcher(history)
+
         if not history:
             return self._call("list_files", {"path": ".", "max_depth": 3})
 
@@ -126,6 +146,51 @@ class DemoModelClient:
             "verification": "已执行本地工具链",
         })
 
+    def _complete_star_catcher(self, history: list[dict[str, Any]]) -> ModelTurn:
+        if not history:
+            return self._call("list_files", {"path": ".", "max_depth": 3})
+
+        last = history[-1]
+        name = last.get("name", "")
+        try:
+            result = json.loads(last.get("content") or "{}")
+        except json.JSONDecodeError:
+            result = {}
+
+        if name == "list_files":
+            return self._call("run_command", {"command": "npm test", "timeout": 30})
+        if name == "run_command":
+            if result.get("ok"):
+                return self._call("finish", {
+                    "summary": "已修复星星捕手的连击计分错误，全部 JavaScript 测试通过。",
+                    "verification": "npm test 执行成功",
+                })
+            return self._call("read_file", {"path": "src/game.js", "start_line": 1, "end_line": 160})
+        if name == "read_file" and result.get("data", {}).get("path") == "src/game.js":
+            return self._call("read_file", {"path": "test/game.test.js", "start_line": 1, "end_line": 180})
+        if name == "read_file":
+            return self._call("apply_patch", {
+                "path": "src/game.js",
+                "old_text": (
+                    "    score: state.score + gainedScore,\n"
+                    "    combo: 0,\n"
+                    "    bestCombo: Math.max(state.bestCombo, nextCombo),\n"
+                ),
+                "new_text": (
+                    "    score: state.score + gainedScore,\n"
+                    "    combo: nextCombo,\n"
+                    "    bestCombo: Math.max(state.bestCombo, nextCombo),\n"
+                ),
+            })
+        if name == "apply_patch":
+            if not result.get("ok"):
+                return self._call("read_file", {"path": "src/game.js", "start_line": 1, "end_line": 160})
+            return self._call("run_command", {"command": "npm test", "timeout": 30})
+        return self._call("finish", {
+            "summary": "网页游戏演示流程已结束，请检查最后一条工具结果。",
+            "verification": "已执行本地工具链",
+        })
+
     @staticmethod
     def _call(name: str, arguments: dict[str, Any]) -> ModelTurn:
         call_id = f"demo_{uuid.uuid4().hex[:10]}"
@@ -141,15 +206,22 @@ class DemoModelClient:
 
 
 def create_model_client() -> ModelClient:
-    api_key = os.getenv("LLM_API_KEY", "").strip()
+    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    generic_api_key = os.getenv("LLM_API_KEY", "").strip()
+    api_key = deepseek_api_key or generic_api_key
     demo_setting = os.getenv("TRACECODER_DEMO", "auto").strip().lower()
     use_demo = demo_setting in {"1", "true", "yes"} or (demo_setting == "auto" and not api_key)
     if use_demo:
         return DemoModelClient()
     if not api_key:
-        raise RuntimeError("模型模式需要设置 LLM_API_KEY；或将 TRACECODER_DEMO 设为 true")
+        raise RuntimeError("模型模式需要设置 DEEPSEEK_API_KEY（或 LLM_API_KEY）；也可将 TRACECODER_DEMO 设为 true")
+
+    base_url = os.getenv("LLM_BASE_URL", "https://api.deepseek.com").strip()
+    model = os.getenv("LLM_MODEL", "deepseek-v4-flash").strip()
+    provider = "deepseek" if deepseek_api_key or "api.deepseek.com" in base_url.lower() else "openai-compatible"
     return OpenAICompatibleClient(
         api_key=api_key,
-        base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
-        model=os.getenv("LLM_MODEL", "gpt-4.1-mini"),
+        base_url=base_url,
+        model=model,
+        provider=provider,
     )

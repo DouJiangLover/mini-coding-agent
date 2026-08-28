@@ -46,9 +46,15 @@ export default defineConfig(async () => {
 
   return {
     css: { postcss: { plugins: [tailwindcss()] } },
-    server: isCodexSeatbeltSandbox
-      ? { watch: { useFsEvents: false, usePolling: true } }
-      : undefined,
+    server: {
+      watch: {
+        // Agent workspaces and audit logs are runtime data, not console source.
+        // Watching them would reload the React page whenever the Agent creates
+        // an index.html, which discards the in-memory run view mid-task.
+        ignored: ['**/examples/**', '**/.tracecoder/**'],
+        ...(isCodexSeatbeltSandbox ? { useFsEvents: false, usePolling: true } : {}),
+      },
+    },
     plugins: [
       vinext(),
       sites(),

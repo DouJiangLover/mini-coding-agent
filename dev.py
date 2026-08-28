@@ -13,7 +13,17 @@ ROOT = Path(__file__).resolve().parent
 
 def main() -> int:
     processes = [
-        subprocess.Popen([sys.executable, "-m", "uvicorn", "backend.main:app", "--reload", "--port", "8000"], cwd=ROOT),
+        subprocess.Popen([
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "backend.main:app",
+            "--reload",
+            "--reload-dir",
+            str(ROOT / "backend"),
+            "--port",
+            "8000",
+        ], cwd=ROOT),
         subprocess.Popen(["npm", "run", "dev"], cwd=ROOT),
     ]
 

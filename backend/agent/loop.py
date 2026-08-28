@@ -18,6 +18,7 @@ TOOL_TITLES = {
     "list_files": "查看项目结构",
     "read_file": "读取文件",
     "search_text": "搜索代码",
+    "create_file": "创建文件",
     "apply_patch": "应用局部补丁",
     "run_command": "运行命令",
     "finish": "提交任务结果",
@@ -35,7 +36,7 @@ class AgentLoop:
         self.events = events
         self.skill_router = skill_router
         self.model = model
-        self.max_steps = max_steps or int(os.getenv("TRACECODER_MAX_STEPS", "18"))
+        self.max_steps = max_steps or int(os.getenv("TRACECODER_MAX_STEPS", "30"))
 
     async def run(self, record: RunRecord, workspace: Path) -> None:
         try:
@@ -152,13 +153,15 @@ class AgentLoop:
                     title, result.summary, payload,
                 )
 
-                if call.name == "apply_patch" and result.ok:
+                if call.name in {"create_file", "apply_patch"} and result.ok:
                     changed_path = str(result.data.get("path", ""))
                     if changed_path and changed_path not in record.changed_files:
                         record.changed_files.append(changed_path)
                     await self.events.emit(
-                        record.run_id, "file_changed", record.phase, "success", f"文件已修改 · {changed_path}",
-                        "局部补丁已应用，可在 Diff 标签中审查。", result.data,
+                        record.run_id, "file_changed", record.phase, "success",
+                        f"文件{'已创建' if call.name == 'create_file' else '已修改'} · {changed_path}",
+                        "新文件内容可在 Diff 标签中审查。" if call.name == "create_file" else "局部补丁已应用，可在 Diff 标签中审查。",
+                        result.data,
                     )
                 if call.name == "run_command" and result.ok:
                     command = str(result.data.get("command", ""))
@@ -257,7 +260,7 @@ class PlanTracker:
     def on_tool_started(self, name: str, has_changes: bool) -> None:
         if name in {"list_files", "read_file", "search_text"}:
             self._running("inspect" if not self._is_done("inspect") else "diagnose")
-        elif name == "apply_patch":
+        elif name in {"create_file", "apply_patch"}:
             self._done("inspect")
             self._done("diagnose")
             self._running("edit")
@@ -273,7 +276,7 @@ class PlanTracker:
         if name in {"list_files", "read_file", "search_text"} and ok:
             self._done("inspect")
             self._running("diagnose")
-        elif name == "apply_patch" and ok:
+        elif name in {"create_file", "apply_patch"} and ok:
             self._done("edit")
             self._running("verify")
         elif name == "run_command" and ok and has_changes:
@@ -300,7 +303,7 @@ class PlanTracker:
 
 
 def _tool_summary(name: str, arguments: dict[str, Any]) -> str:
-    if name in {"read_file", "list_files", "apply_patch"}:
+    if name in {"read_file", "list_files", "create_file", "apply_patch"}:
         return str(arguments.get("path", "."))
     if name == "search_text":
         return f"搜索：{arguments.get('query', '')}"
@@ -316,7 +319,7 @@ def _safe_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     for key in list(safe):
         if any(token in key.lower() for token in ("key", "token", "secret", "password")):
             safe[key] = "[REDACTED]"
-    for key in ("old_text", "new_text"):
+    for key in ("old_text", "new_text", "content"):
         if isinstance(safe.get(key), str) and len(safe[key]) > 2_000:
             safe[key] = safe[key][:2_000] + "\n... 已截断 ..."
     return safe

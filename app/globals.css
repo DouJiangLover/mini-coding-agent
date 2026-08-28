@@ -77,24 +77,18 @@ button:disabled { cursor: default; }
 
 .sidebar-nav { flex: 1; overflow-y: auto; padding: 8px 0; }
 .sidebar-nav > p { margin: 7px 10px 8px; color: var(--faint); font-size: 9px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
-.sidebar-nav .history-label { margin-top: 28px; }
-
+.sidebar-nav .sidebar-section-label { margin-top: 24px; }
 .nav-item {
   width: 100%; min-height: 52px; display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 7px;
   align-items: center; padding: 7px 8px; border: 0; border-radius: 8px; background: transparent; text-align: left;
 }
 .nav-item:hover, .nav-item.active { background: rgba(255,255,255,.72); }
 .nav-item.active { box-shadow: inset 0 0 0 1px rgba(216,215,210,.7); }
+.nav-item:disabled { opacity: .58; }
 .nav-icon { width: 26px; height: 26px; display: grid; place-items: center; color: #66665f; border-radius: 6px; background: rgba(0,0,0,.035); font: 11px var(--mono); }
 .nav-item strong, .nav-item small { display: block; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .nav-item strong { font-size: 11px; font-weight: 650; }
 .nav-item small { margin-top: 3px; color: var(--muted); font-size: 9px; }
-
-.history-item { min-height: 32px; margin: 1px 3px; padding: 7px 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-radius: 7px; font-size: 10px; }
-.history-item:hover { background: rgba(255,255,255,.55); }
-.history-item span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.history-item time { flex: none; color: var(--faint); font-size: 8px; }
-.history-item.muted { color: var(--muted); }
 
 .sidebar-footer { border-top: 1px solid rgba(210,209,204,.8); padding: 10px 3px 0; }
 .connection-line { min-height: 30px; padding: 0 8px; display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 9px; }
@@ -125,19 +119,6 @@ button:disabled { cursor: default; }
 .run-state.failed i, .run-state.cancelled i { background: var(--red); }
 
 .conversation-scroll { min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #d4d3ce transparent; }
-.welcome-state { width: min(760px, calc(100% - 48px)); min-height: 100%; margin: 0 auto; padding: clamp(64px, 11vh, 112px) 0 48px; display: flex; flex-direction: column; align-items: center; text-align: center; }
-.welcome-mark { width: 52px; height: 52px; padding: 5px; border: 1px solid var(--line); border-radius: 15px; background: #fafaf8; box-shadow: 0 8px 30px rgba(30,30,26,.06); }
-.welcome-mark span { width: 100%; height: 100%; display: grid; place-items: center; border-radius: 10px; background: #272824; color: white; font: 750 13px var(--mono); }
-.welcome-kicker { margin: 18px 0 7px; color: var(--accent); font: 700 8px var(--mono); letter-spacing: .14em; }
-.welcome-state h1 { margin: 0; font-family: Georgia, 'Times New Roman', serif; font-size: clamp(32px, 4vw, 46px); font-weight: 450; letter-spacing: -.04em; }
-.welcome-copy { max-width: 540px; margin: 14px 0 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
-.suggestion-grid { width: 100%; margin-top: 38px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-.suggestion-grid button { position: relative; min-width: 0; min-height: 128px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: #fbfbfa; text-align: left; transition: border-color .16s, background .16s, transform .16s; }
-.suggestion-grid button:hover { transform: translateY(-2px); border-color: #cfcfc9; background: white; box-shadow: 0 8px 24px rgba(25,25,22,.05); }
-.suggestion-icon { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 7px; color: var(--accent); background: var(--accent-soft); font: 700 11px var(--mono); }
-.suggestion-grid strong { display: block; margin-top: 15px; font-size: 11px; }
-.suggestion-grid small { display: -webkit-box; margin-top: 6px; overflow: hidden; color: var(--muted); font-size: 9px; line-height: 1.5; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-.suggestion-arrow { position: absolute; top: 17px; right: 16px; color: #b0afa9; font-size: 11px; }
 
 .chat-thread { width: min(790px, calc(100% - 52px)); margin: 0 auto; padding: 38px 0 48px; }
 .message { display: grid; grid-template-columns: 30px minmax(0,1fr); gap: 12px; }
@@ -190,7 +171,7 @@ button:disabled { cursor: default; }
 .composer-toolbar { min-height: 42px; padding: 5px 7px 7px 12px; display: flex; align-items: center; gap: 8px; }
 .path-pill { max-width: 50%; min-width: 0; height: 27px; display: flex; align-items: center; gap: 5px; padding: 0 8px; border-radius: 7px; background: #f2f2ef; color: var(--muted); }
 .path-pill span { flex: none; color: var(--accent); font-size: 12px; }
-.path-pill input { min-width: 0; width: 210px; border: 0; outline: 0; background: transparent; font: 8px var(--mono); }
+.path-pill code { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font: 8px var(--mono); }
 .keyboard-hint { margin-left: auto; color: var(--faint); font-size: 7px; }
 .send-button, .stop-button { flex: none; width: 30px; height: 30px; display: grid; place-items: center; border: 0; border-radius: 8px; color: white; }
 .send-button { background: #272824; font-size: 16px; box-shadow: 0 2px 0 #090a09; }
@@ -284,10 +265,6 @@ button:disabled { cursor: default; }
 
 @media (max-width: 1180px) {
   .app-shell { grid-template-columns: 205px minmax(480px,1fr) 340px; }
-  .suggestion-grid { grid-template-columns: 1fr; max-width: 560px; }
-  .suggestion-grid button { min-height: 82px; }
-  .suggestion-grid strong { margin-top: 10px; }
-  .welcome-state { padding-top: 54px; }
 }
 
 @media (max-width: 980px) {
@@ -302,13 +279,8 @@ button:disabled { cursor: default; }
   .workspace-breadcrumb span:not(.folder-mark), .run-id { display: none; }
   .workspace-breadcrumb strong { max-width: 45vw; }
   .inspector { display: none; }
-  .welcome-state { width: calc(100% - 28px); padding-top: 50px; }
-  .welcome-state h1 { font-size: 34px; }
-  .suggestion-grid { margin-top: 28px; }
-  .suggestion-grid button { min-height: 76px; }
   .chat-thread { width: calc(100% - 28px); padding-top: 26px; }
   .composer-zone { padding: 8px 10px 11px; }
   .keyboard-hint { display: none; }
   .path-pill { max-width: calc(100% - 45px); }
-  .path-pill input { width: 100%; }
 }

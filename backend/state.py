@@ -44,3 +44,8 @@ class RunStore:
     def get(self, run_id: str) -> RunRecord | None:
         return self._runs.get(run_id)
 
+    def has_active_workspace(self, workspace: str) -> bool:
+        return any(
+            run.workspace == workspace and run.status in {"created", "running"}
+            for run in self._runs.values()
+        )

@@ -13,6 +13,7 @@ from backend.workspace.guard import WorkspaceGuard, WorkspaceViolation
 
 
 MAX_TEXT_CHARS = 12_000
+MAX_CREATED_FILE_CHARS = 80_000
 SKIPPED_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__", ".next"}
 TEXT_SUFFIXES = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".md", ".txt", ".css", ".html",
@@ -46,6 +47,7 @@ class ToolRegistry:
             "list_files": self.list_files,
             "read_file": self.read_file,
             "search_text": self.search_text,
+            "create_file": self.create_file,
             "apply_patch": self.apply_patch,
             "run_command": self.run_command,
             "finish": self.finish,
@@ -53,7 +55,7 @@ class ToolRegistry:
 
     @staticmethod
     def available_names() -> list[str]:
-        return ["list_files", "read_file", "search_text", "apply_patch", "run_command", "finish"]
+        return ["list_files", "read_file", "search_text", "create_file", "apply_patch", "run_command", "finish"]
 
     def schemas(self) -> list[dict[str, Any]]:
         schemas = [
@@ -70,6 +72,10 @@ class ToolRegistry:
                 "query": {"type": "string", "description": "要搜索的文本"},
                 "path": {"type": "string", "description": "搜索目录，默认 ."},
             }, required=["query"]),
+            _schema("create_file", "在工作区内创建一个新的 UTF-8 文本文件；文件已存在时拒绝覆盖。", {
+                "path": {"type": "string", "description": "新文件的相对路径，可自动创建父目录"},
+                "content": {"type": "string", "description": "完整文件内容，最多 80000 个字符"},
+            }, required=["path", "content"]),
             _schema("apply_patch", "把文件中唯一匹配的 old_text 替换为 new_text，并返回 diff。", {
                 "path": {"type": "string", "description": "相对文件路径"},
                 "old_text": {"type": "string", "description": "文件中必须唯一出现的原文本"},
@@ -166,6 +172,33 @@ class ToolRegistry:
                 break
         output = "\n".join(matches) if matches else "未找到匹配内容"
         return ToolResult(True, f"搜索到 {len(matches)} 条结果", {"query": query, "output": output}, truncated=len(matches) >= 50)
+
+    def create_file(self, path: str, content: str) -> ToolResult:
+        target = self.guard.resolve(path, must_exist=False)
+        if target.exists():
+            raise ValueError("目标文件已存在；请先读取后使用 apply_patch 局部修改")
+        if target.suffix.lower() not in TEXT_SUFFIXES and target.name not in {"Dockerfile", "Makefile"}:
+            raise ValueError("只允许创建受支持的文本文件类型")
+        if "\x00" in content:
+            raise ValueError("文件内容不能包含二进制空字节")
+        if len(content) > MAX_CREATED_FILE_CHARS:
+            raise ValueError(f"单个新文件最多 {MAX_CREATED_FILE_CHARS} 个字符")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with target.open("x", encoding="utf-8") as handle:
+                handle.write(content)
+        except FileExistsError as exc:
+            raise ValueError("目标文件已存在；拒绝覆盖") from exc
+        diff = "".join(difflib.unified_diff(
+            [], content.splitlines(keepends=True), fromfile="/dev/null", tofile=f"b/{path}",
+        ))
+        diff_text, truncated = _truncate(diff)
+        return ToolResult(
+            True,
+            f"已创建新文件 {path}",
+            {"path": path, "diff": diff_text, "created": True, "characters": len(content)},
+            truncated=truncated,
+        )
 
     def apply_patch(self, path: str, old_text: str, new_text: str) -> ToolResult:
         target = self.guard.resolve(path)
