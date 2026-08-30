@@ -3,6 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 
+WORKSPACE_BROWSER_SKIPPED_NAMES = {
+    ".git", ".idea", ".next", ".tracecoder", ".venv", ".vscode",
+    "__pycache__", "build", "dist", "node_modules", "venv",
+}
+
+
 class WorkspaceViolation(ValueError):
     pass
 
@@ -43,3 +49,30 @@ def resolve_workspace(project_root: Path, requested: str) -> Path:
     if not candidate.is_dir():
         raise WorkspaceViolation(f"工作区不存在：{requested}")
     return candidate
+
+
+def list_workspace_directories(project_root: Path, requested: str = ".") -> tuple[Path, list[Path]]:
+    """Return safe, visible child directories for the local workspace picker."""
+    root = project_root.resolve()
+    current = resolve_workspace(root, requested)
+    directories: list[Path] = []
+    try:
+        children = sorted(current.iterdir(), key=lambda item: item.name.lower())
+    except OSError as exc:
+        raise WorkspaceViolation(f"无法读取工作区目录：{requested}") from exc
+
+    for child in children:
+        if child.name.startswith(".") or child.name in WORKSPACE_BROWSER_SKIPPED_NAMES:
+            continue
+        try:
+            resolved = child.resolve()
+            if not resolved.is_dir():
+                continue
+            if resolved != root and root not in resolved.parents:
+                continue
+        except OSError:
+            continue
+        directories.append(resolved)
+        if len(directories) >= 100:
+            break
+    return current, directories

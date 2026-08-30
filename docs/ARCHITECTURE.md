@@ -18,8 +18,12 @@ flowchart LR
     A --> R[RunStore]
     A --> L[AgentLoop]
     L --> S[SkillRouter]
+    L --> I[Interaction Model]
+    I -->|确认 / 调整意见| U
     L <-->|消息与 Tool Calling| M[DeepSeek / OpenAI-compatible API]
     L --> T[ToolRegistry]
+    T -->|额外权限| P[单次授权关卡]
+    P -->|允许 / 拒绝| L
     T --> G[WorkspaceGuard]
     G --> W[本地项目工作区]
     T -->|结构化工具结果| L
@@ -36,6 +40,10 @@ flowchart LR
 
 前端只展示和控制任务，不参与模型决策。当前运行标识、任务和工作区会保存在浏览器会话中；即使页面意外刷新，前端也会从后端恢复已有事件并重新连接尚未结束的事件流。
 
+TracePet 是前端的多任务协调视图。后端可以让不同工作区的 `AgentLoop` 协程并行运行，前端每 3 秒读取轻量任务摘要，展示计划进度、最近事件与等待状态。用户切换任务时只更换当前观察的 SSE 连接，不会取消原来的后台协程。状态从运行中变为等待确认、完成或失败时，TracePet 产生应用内提醒。为避免两个 Agent 竞争同一文件，同一个规范化工作区只能存在一个活动任务。
+
+独立的 `/settings` 页面允许用户调整 Agent 的工作方式，而不是改写安全代码。后端在每个任务开始时读取一份不可变配置快照，因此设置变更只作用于之后的新任务，不会让正在执行的循环中途改变规则。
+
 ## 3. 一次任务如何运行
 
 ### 3.1 创建任务
@@ -49,7 +57,7 @@ flowchart LR
 
 ### 3.2 选择 Skill
 
-`SkillRouter` 从 `skills/*/skill.json` 加载所有 Skill，根据任务中出现的关键词进行可解释评分，选出得分最高的能力包。目前包含：
+`SkillRouter` 从 `skills/*/skill.json` 加载所有启用的 Skill。任务可以在前端手动指定能力，也可以使用自动混合路由。目前包含：
 
 | Skill | 适用任务 | 主要特点 |
 | --- | --- | --- |
@@ -68,19 +76,59 @@ skills/<name>/
 
 Skill 不直接执行代码。它的作用是动态装配本轮任务的策略提示词、计划模板和最小工具权限，因此新增任务能力通常不需要修改 Agent 主循环。
 
-### 3.3 构造模型上下文
+自动路由分为两层：先统计触发词命中次数形成可解释候选；真实模型模式再仅根据用户任务、候选名称、描述、触发词和得分调用 `select_skill`，返回 Skill、置信度和简短理由。路由调用没有文件或命令工具，不能对工作区产生副作用。如果置信度低于 0.68，运行状态进入 `waiting_skill_confirmation`，前端展示候选供用户确认；确认后继续同一个执行协程。演示模式和模型路由故障会回退到确定性关键词评分。
+
+手动选择优先于自动路由，置信度视为 1.0。无论采用哪种方式，最终都只装配一项主 Skill，避免多个能力包合并时无意扩大工具权限。
+
+前端 `/skills` 页面通过以下本地接口管理能力：
+
+- `GET /api/skills`：列出内置与自定义 Skill 及启用状态；
+- `POST /api/skills`：创建包含触发词、策略和默认工具集合的自定义 Skill；
+- `POST /api/skills/{name}/status`：启用或停用指定 Skill。
+
+`SkillRouter` 在每个新任务开始时只对启用项评分。配置以原子替换方式写入 `.tracecoder/skill-config.json`，重启后仍然生效；至少保留一个启用项，避免 Agent 无策略可选。自定义内容只改变模型策略和默认工具集合，不能改写 WorkspaceGuard、凭据保护或命令风险规则。
+
+### 3.3 Interaction-First 交互确认
+
+当且仅当任务命中 Frontend Build Skill 时，Agent 不会直接进入代码循环，而是先读取工作区根目录中的需求文档，调用模型生成一份结构化产品交互模型：
+
+- 1–8 个终端用户页面及其职责；
+- 1–12 条页面流转，边的起止点必须引用真实页面 ID；
+- 1–12 条核心状态变化；
+- 1–10 条可核对的验收标准。
+
+宿主程序对模型参数进行完整校验，生成 `interaction_model_created` 事件，然后把运行状态切换为 `waiting_interaction_confirmation`。此时执行协程等待用户决定，尚未创建 ToolRegistry，也不会执行任何文件写入。用户有两种选择：
+
+1. **符合预期，继续实现**：确认的交互模型写入执行系统消息，成为后续实现和完成前核对的约束；
+2. **需要调整**：调整意见和上一版模型一起反馈给模型，生成完整新版本并再次确认，最多迭代 5 版。
+
+这一设计把新产品任务从“需求直接翻译为代码”改成“需求 → 交互模型 → 人工确认 → 实现 → 验证”，同时不打断 Bug Fix、Test Writer 和 Documentation 等已有项目任务。
+
+### 3.4 读取 Agent 配置快照
+
+`AgentSettingsStore` 将用户配置原子写入 `.tracecoder/agent-settings.json`。一次任务启动时，`AgentLoop` 只读取一次快照，并把运行模式、质量关卡和预算同时传给提示词、工具注册表与循环终止逻辑。
+
+可调项分为三组：
+
+- **运行模式**：标准模式按 Skill 最小权限运行；安全模式对写入和命令逐次确认；自主模式减少低风险确认；只读模式从宿主层禁止文件写入；
+- **质量关卡**：Interaction-First、修改后强制验证、完成前自检；
+- **执行预算**：最大步骤、连续失败上限、上下文字符预算、单条命令超时。
+
+运行模式只决定低风险动作是否自动执行。工作区越界、凭据文件、Shell 拼接和危险删除参数仍由 `WorkspaceGuard` 与 `ToolRegistry` 硬编码拒绝，任何页面选项和用户单次授权都不能绕过。
+
+### 3.5 构造模型上下文
 
 Agent 创建初始消息：
 
 - 系统消息：身份、安全规则、所选 Skill 策略、工作区和完成要求；
 - 用户消息：原始任务；
-- 工具 Schema：当前 Skill 允许调用的工具及其 JSON 参数格式。
+- 工具 Schema：全部本地工具及其 JSON 参数格式；Skill 外工具会标记为需要用户单次授权。
 
 真实模型模式直接调用 DeepSeek 的 OpenAI-compatible `chat/completions` 接口，并使用模型原生 Tool Calling。API Key 只放在请求头中，不进入模型消息、事件日志或前端。
 
 没有配置 API Key 时，可以使用确定性的本地演示模型。演示模型仍然经过同一套 ToolRegistry、WorkspaceGuard、事件流和终止逻辑，只是不产生真实模型请求。
 
-### 3.4 观察—行动—反馈循环
+### 3.6 观察—行动—反馈循环
 
 Agent 的核心不是一次性生成整个答案，而是反复执行以下闭环：
 
@@ -115,6 +163,9 @@ for step in range(max_steps):
 
     for call in turn.tool_calls:
         result = await tool_registry.execute(call.name, call.arguments)
+        if result.approval_required:
+            decision = await wait_for_user_decision(result)
+            result = await execute_once_if_allowed(call, decision)
         emit_events(call, result)
         messages.append(as_tool_observation(result))
 
@@ -125,7 +176,19 @@ for step in range(max_steps):
 stop_safely_when_budget_exhausted()
 ```
 
-工具失败不会直接使 Agent 崩溃。错误会像正常结果一样写回上下文，模型可以重新读取文件、调整补丁或改用其他方法，这构成了失败恢复能力。
+工具失败不会直接使 Agent 崩溃。错误会像正常结果一样写回上下文，模型可以重新读取文件、调整补丁或改用其他方法，这构成了失败恢复能力。测试命令返回非零退出码被视为开发过程中的正常诊断结果，不累计为工具故障；权限校验、参数错误和宿主执行异常才进入连续失败计数。
+
+### 3.6 质量关卡
+
+为了用少量额外轮次换取更高成功率，宿主程序会检查 Agent 是否完成必要证据链：
+
+1. 修改前至少成功列出、读取或搜索过项目；
+2. Bug Fix 和 Test Writer 在修改前必须运行现有检查，建立失败基线；
+3. 产生文件改动后必须有一次成功的测试或等价验证；
+4. 第一次调用 `finish` 不会立即结束，而是进入完成前自检；
+5. Agent 至少重新读取一个改动文件或检查 Git Diff 后，第二次 `finish` 才能完成。
+
+未满足关卡时会产生 `quality_checkpoint` 事件和结构化工具反馈，模型据此回到缺失节点，不计入连续失败。
 
 ## 4. 本地工具系统
 
@@ -138,12 +201,12 @@ stop_safely_when_budget_exhausted()
 | `search_text` | 搜索工作区内容 | 只搜索受支持的文本文件 |
 | `create_file` | 创建新文本文件 | 仅新文件、拒绝覆盖、限制类型和大小 |
 | `apply_patch` | 局部替换已有文件 | `old_text` 必须唯一匹配并返回 Diff |
-| `run_command` | 执行开发命令 | 白名单、无 Shell、超时、输出截断 |
+| `run_command` | 执行开发命令 | 默认允许列表、额外命令逐次授权、无 Shell、超时、输出截断 |
 | `finish` | 提交最终结果 | 明确结束循环并提供总结与验证结果 |
 
 “创建”和“修改”被设计成两个工具：`create_file` 不能覆盖文件，`apply_patch` 又要求旧文本唯一匹配。这样可以降低整文件重写、静默覆盖和基于过期内容修改的风险。
 
-`run_command` 使用参数数组启动子进程，而不是交给 Shell 解释，因此管道、重定向和命令拼接不会生效。当前只允许常见开发命令；Git 仅开放 `status`、`diff`、`log`、`show` 等只读操作。
+`run_command` 使用参数数组启动子进程，并禁止启动 Shell 解释器，因此管道、重定向和命令拼接不会生效。常见开发命令默认允许；Git 写操作、依赖安装和其他额外命令必须展示完整参数并获得单次授权。
 
 ## 5. 状态机与终止条件
 
@@ -152,17 +215,31 @@ stop_safely_when_budget_exhausted()
 ```mermaid
 stateDiagram-v2
     [*] --> selecting_skill
-    selecting_skill --> planning
-    planning --> executing
-    executing --> verifying: 修改后运行命令
-    executing --> recovering: 工具失败
-    verifying --> executing: 继续修复
-    recovering --> executing: 调整方案
-    executing --> completed: finish 成功
-    verifying --> completed: finish 成功
-    executing --> failed: 触发停止条件
+    selecting_skill --> waiting_skill_confirmation: 路由置信度不足
+    waiting_skill_confirmation --> selecting_skill: 用户确认候选
+    waiting_skill_confirmation --> cancelled: 用户停止
+    selecting_skill --> interaction_modeling: Frontend Build
+    interaction_modeling --> waiting_interaction_confirmation: 输出交互模型
+    waiting_interaction_confirmation --> interaction_modeling: 用户提出调整
+    waiting_interaction_confirmation --> planning: 用户确认
+    waiting_interaction_confirmation --> cancelled: 用户停止
+    selecting_skill --> planning: 其他 Skill
+    planning --> inspecting
+    inspecting --> reproducing: 建立修改前基线
+    reproducing --> diagnosing: 获得真实输出
+    diagnosing --> implementing: 定位根因
+    implementing --> waiting_approval: 需要额外权限
+    waiting_approval --> implementing: 允许一次或拒绝后重规划
+    waiting_approval --> cancelled: 用户停止
+    implementing --> verifying: 修改后运行命令
+    verifying --> diagnosing: 验证未通过
+    verifying --> reviewing: 首次 finish
+    reviewing --> completed: 自检后再次 finish
+    diagnosing --> recovering: 工具故障
+    recovering --> diagnosing: 调整方案
+    diagnosing --> failed: 触发停止条件
     recovering --> failed: 连续失败
-    executing --> cancelled: 用户停止
+    implementing --> cancelled: 用户停止
 ```
 
 循环不会无限运行，以下任一条件都会终止任务：
@@ -205,15 +282,15 @@ examples/2048-game
 
 模型在一次运行中只能看到当前选中的工作区，不能跨项目读写。
 
-### 7.2 当前授权策略
+### 7.2 分级授权策略
 
-用户点击“开始运行”，表示授权 Agent 在当前工作区中执行该 Skill 允许的低风险操作。读取、创建文本文件、局部修改和运行受控测试不逐步弹窗确认，否则会严重打断自主闭环。
+用户点击“开始运行”，表示授权 Agent 在当前工作区中执行该 Skill 允许的低风险操作。读取、局部修改和运行受控测试不逐步弹窗确认，否则会严重打断自主闭环。
 
-当前没有交互式高风险审批窗口。删除文件、安装依赖、联网命令、Git 写操作等高风险能力没有开放，而是直接被工具集合或命令白名单禁止。因此当前策略可以概括为：
+当模型确实需要 Skill 外工具、内联脚本、Git 写操作或其他受限命令时，ToolRegistry 返回 `approval_required`，Agent 将状态切换为 `waiting_approval` 并产生授权事件。前端展示工具、完整参数、原因和风险，用户可以允许一次或拒绝。允许只对该次原始动作有效，不会永久提升 Skill 权限；拒绝会成为新的工具反馈，模型可以调整方案。
 
-> 低风险操作在任务授权范围内自动执行；尚未开放的高风险操作直接拒绝。
+工作区越界、访问凭据文件以及高风险删除参数仍然直接拒绝，不能通过前端授权绕过。因此当前策略可以概括为：
 
-如果以后开放高风险工具，合理的扩展是由后端先产生 `approval_required` 事件并暂停运行，前端提供“允许一次”或“拒绝”，再由 Agent 继续执行。
+> 低风险操作自动执行；可审查的额外能力逐次授权；不可接受的安全边界始终拒绝。
 
 这是一层应用级防护，并不等价于容器或操作系统级沙箱，因此工作区仍应只包含可信项目。
 
@@ -223,10 +300,15 @@ Agent 每发生一次重要变化都会创建结构化事件，例如：
 
 - `run_started`：任务开始；
 - `skill_selected`：Skill 选择结果及原因；
+- `interaction_context_collected`：已读取产品需求资料；
+- `interaction_model_created`：结构化页面流、状态流和验收标准；
+- `interaction_confirmation_requested` / `interaction_confirmation_resolved`：产品流程确认、修改意见和最终决定；
 - `plan_updated`：计划进度变化；
 - `phase_changed`：执行阶段切换；
 - `tool_started` / `tool_finished`：工具调用及结果；
 - `file_changed`：文件 Diff；
+- `quality_checkpoint`：缺失基线、验证或完成前自检时的质量关卡；
+- `approval_requested` / `approval_resolved`：授权请求和用户决定；
 - `error`：可恢复或终止错误；
 - `run_finished`：最终状态和总结。
 
@@ -244,9 +326,18 @@ Agent 每发生一次重要变化都会创建结构化事件，例如：
 | --- | --- |
 | `GET /api/health` | 查看后端状态、模型模式和模型名称 |
 | `POST /api/runs` | 创建一次 Agent 运行 |
+| `GET /api/runs` | 获取所有当前进程任务的轻量状态、计划进度和最近事件 |
 | `GET /api/runs/{run_id}` | 查询运行状态和已有事件 |
 | `GET /api/runs/{run_id}/events` | 通过 SSE 接收实时事件 |
 | `POST /api/runs/{run_id}/cancel` | 请求停止运行 |
+| `POST /api/runs/{run_id}/skill-selection/{selection_id}` | 确认低置信度路由产生的 Skill 候选 |
+| `POST /api/runs/{run_id}/approvals/{approval_id}` | 允许或拒绝一项等待中的单次操作 |
+| `GET /api/settings` | 获取 Agent 模式、质量关卡和执行预算 |
+| `POST /api/settings` | 校验并保存 Agent 配置，从下一任务生效 |
+| `POST /api/settings/reset` | 恢复推荐的标准配置 |
+| `GET /api/skills` | 列出 Skill 与启用状态 |
+| `POST /api/skills` | 创建自定义 Skill |
+| `POST /api/skills/{name}/status` | 启用或停用 Skill |
 | `POST /api/demo/reset` | 安全重置内置演示工作区；运行中的工作区会拒绝重置 |
 
 当前数据采用轻量设计：运行状态保存在进程内存中，审计事件持久化为 JSONL。后端重启后历史日志仍在，但当前版本不会自动把旧日志恢复到 `RunStore`。
@@ -267,19 +358,23 @@ Agent 每发生一次重要变化都会创建结构化事件，例如：
 
 ```text
 app/                   前端工作台与界面样式
+├── settings/          Agent 设置页面
+└── skills/            Skill 管理页面
 backend/
 ├── agent/             Agent 主循环、计划与上下文裁剪
 ├── llm/               DeepSeek/OpenAI-compatible 和演示模型客户端
-├── skills/            Skill 加载与关键词路由
+├── skills/            Skill 加载、候选评分与配置管理
 ├── tools/             本地工具定义、参数校验和执行
 ├── workspace/         工作区路径与凭据保护
 ├── events/            内存事件通道、SSE 数据源和 JSONL 日志
 ├── main.py            API 入口与运行调度
+├── settings.py        Agent 配置校验、持久化与快照
 └── state.py           RunRecord 和 RunStore
 skills/                可插拔 Skill 元数据与提示词
 examples/              相互隔离、可重复重置的演示工作区
 tests/                 单元测试和完整 Agent 闭环测试
 .tracecoder/runs/      本地运行审计日志（不入库）
+.tracecoder/agent-settings.json  本地 Agent 设置（不入库）
 ```
 
 ## 11. 核心设计点
@@ -290,7 +385,7 @@ tests/                 单元测试和完整 Agent 闭环测试
 
 ### 11.2 Skill 同时约束策略和权限
 
-Skill 不只是附加提示词，还决定本轮允许暴露给模型的工具集合。Frontend Build 可以创建文件，而 Bug Fix 默认只能修改已有文件，这体现了最小权限原则。
+Skill 不只是附加提示词，还决定本轮可以自动执行的工具集合。模型仍可看到其他工具，但调用时必须经过单次授权。Frontend Build 可以自动创建文件，而 Bug Fix 创建新文件会暂停等待用户决定，这体现了最小权限与任务恢复之间的平衡。
 
 ### 11.3 真实反馈驱动，而非一次性生成
 
@@ -309,14 +404,15 @@ Skill 不只是附加提示词，还决定本轮允许暴露给模型的工具�
 `examples/2048-game` 初始只保留 `REQUIREMENTS.md`。用户要求按照文档实现项目时，典型流程为：
 
 1. SkillRouter 选择 Frontend Build Skill；
-2. Agent 列出目录并读取需求；
-3. 模型规划项目结构与测试策略；
-4. 通过 `create_file` 创建页面、样式、游戏逻辑和测试；
-5. 执行 `npm test`；
-6. 如果测试失败，把错误输出反馈给模型；
-7. 模型重新读取相关代码并用 `apply_patch` 修复；
-8. 再次运行测试；
-9. 验证成功后调用 `finish`，前端展示总结和改动文件。
+2. Agent 读取需求，生成页面流转、游戏状态机和验收标准；
+3. 前端展示交互模型并暂停，用户可以确认或提出修改意见；
+4. 用户确认后，Agent 才列出目录、读取需求并规划项目结构与测试策略；
+5. 通过 `create_file` 创建页面、样式、游戏逻辑和测试；
+6. 执行 `npm test`；
+7. 如果测试失败，把错误输出反馈给模型；
+8. 模型重新读取相关代码并用 `apply_patch` 修复；
+9. 再次运行测试并对照已确认交互模型自检；
+10. 验证成功后调用 `finish`，前端展示总结和改动文件。
 
 这条链路同时展示了需求理解、Skill 选择、自主创建、真实执行、失败恢复和结果验证，是本项目最完整的演示场景。
 
@@ -326,13 +422,13 @@ Skill 不只是附加提示词，还决定本轮允许暴露给模型的工具�
 
 - RunStore 是单进程内存状态，不支持多实例和重启恢复；
 - 上下文采用字符裁剪，尚未建立代码语义索引；
-- Skill 路由使用关键词评分，复杂组合任务可能只选择一个 Skill；
-- 安全层是应用级白名单，不是操作系统沙箱；
-- 高风险操作目前直接禁止，尚未实现人工审批和恢复执行；
+- Skill 路由当前只装配一个主 Skill，尚未支持多 Skill 组合任务；
+- 安全层是应用级校验与人工审批，不是操作系统沙箱；
+- Skill、授权和交互确认等待状态尚未跨后端重启持久化，也没有自动超时策略；
 - JSONL 已支持审计，但尚未提供独立的 Replay 页面。
 
-可继续扩展的优先级是：高风险审批关卡、可恢复运行状态、Skill 组合、代码地图与事件回放。这些功能都可以沿用现有的工具、事件和状态机接口增加，而不需要推翻核心架构。
+可继续扩展的优先级是：授权超时与持久化恢复、Skill 组合、代码地图与事件回放。这些功能都可以沿用现有的工具、事件和状态机接口增加，而不需要推翻核心架构。
 
 ## 14. 一句话介绍
 
-> TraceCoder 是一个支持可插拔 Skill、受控本地工具、失败反馈、显式终止和实时执行可视化的轻量级编程智能体；模型负责决策，宿主程序负责安全执行。
+> TraceCoder 是一个采用 Interaction-First 工作流、支持可插拔 Skill、受控本地工具、失败反馈和实时执行可视化的轻量级编程智能体；模型先与用户确认产品交互，再由宿主程序安全执行。

@@ -6,8 +6,10 @@
   "allowed_tools": ["list_files", "read_file", "search_text", "apply_patch", "run_command", "finish"],
   "plan": [
     {"id": "inspect", "title": "分析项目结构和入口", "status": "running"},
+    {"id": "baseline", "title": "核验现有命令和项目事实", "status": "pending"},
     {"id": "diagnose", "title": "核对安装与运行方式", "status": "pending"},
     {"id": "edit", "title": "编写准确的项目文档", "status": "pending"},
-    {"id": "verify", "title": "检查命令和内容完整性", "status": "pending"}
+    {"id": "verify", "title": "检查命令和内容完整性", "status": "pending"},
+    {"id": "review", "title": "复读文档并检查遗漏", "status": "pending"}
   ]
 }

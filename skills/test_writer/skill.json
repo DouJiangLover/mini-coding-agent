@@ -6,8 +6,10 @@
   "allowed_tools": ["list_files", "read_file", "search_text", "apply_patch", "run_command", "finish"],
   "plan": [
     {"id": "inspect", "title": "理解功能与现有测试风格", "status": "running"},
+    {"id": "baseline", "title": "运行现有测试建立基线", "status": "pending"},
     {"id": "diagnose", "title": "确定需要覆盖的行为", "status": "pending"},
     {"id": "edit", "title": "添加聚焦的测试用例", "status": "pending"},
-    {"id": "verify", "title": "运行完整测试验证", "status": "pending"}
+    {"id": "verify", "title": "运行完整测试验证", "status": "pending"},
+    {"id": "review", "title": "审查断言质量与边界覆盖", "status": "pending"}
   ]
 }

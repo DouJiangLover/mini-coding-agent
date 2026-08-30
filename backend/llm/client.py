@@ -105,6 +105,13 @@ class DemoModelClient:
             for message in messages
             if message.get("role") == "user"
         ).lower()
+        tool_names = {
+            str(tool.get("function", {}).get("name", ""))
+            for tool in tools
+            if isinstance(tool, dict)
+        }
+        if "submit_interaction_model" in tool_names:
+            return self._interaction_model(task_text)
         history_text = "\n".join(str(message.get("content") or "") for message in history).lower()
         is_star_workspace = all(marker in history_text for marker in ("package.json", "game.js", "game.test.js"))
         if "星星捕手" in task_text or "star-catcher" in task_text or "combo" in task_text or is_star_workspace:
@@ -119,6 +126,18 @@ class DemoModelClient:
             result = json.loads(last.get("content") or "{}")
         except json.JSONDecodeError:
             result = {}
+
+        if name == "finish" and result.get("data", {}).get("checkpoint_kind") == "review":
+            return self._call("read_file", {
+                "path": result.get("data", {}).get("review_path", "src/calculator.py"),
+                "start_line": 1,
+                "end_line": 200,
+            })
+        if name == "read_file" and self._review_checkpoint_pending(history):
+            return self._call("finish", {
+                "summary": "已完成修复、验证和完成前自检。",
+                "verification": "测试通过，并重新读取改动文件确认实现",
+            })
 
         if name == "list_files":
             return self._call("run_command", {"command": "pytest -q", "timeout": 30})
@@ -146,6 +165,52 @@ class DemoModelClient:
             "verification": "已执行本地工具链",
         })
 
+    def _interaction_model(self, task_text: str) -> ModelTurn:
+        if "2048" in task_text:
+            return self._call("submit_interaction_model", {
+                "title": "2048 小游戏",
+                "summary": "玩家通过方向操作合并数字、累计分数，并在胜利或无路可走时获得明确反馈。",
+                "pages": [
+                    {"id": "game", "name": "游戏主界面", "purpose": "展示棋盘、分数、最高分和主要操作"},
+                    {"id": "result", "name": "结果提示层", "purpose": "展示胜利或失败状态并提供后续选择"},
+                ],
+                "flows": [
+                    {"from": "game", "action": "点击新游戏", "to": "game"},
+                    {"from": "game", "action": "合成 2048 或无可用移动", "to": "result"},
+                    {"from": "result", "action": "继续游戏或重新开始", "to": "game"},
+                ],
+                "states": [
+                    {"from": "ready", "event": "开始新游戏", "to": "playing"},
+                    {"from": "playing", "event": "合成 2048", "to": "won"},
+                    {"from": "won", "event": "选择继续", "to": "playing"},
+                    {"from": "playing", "event": "无可用移动", "to": "lost"},
+                    {"from": "lost", "event": "开始新游戏", "to": "playing"},
+                ],
+                "acceptance_criteria": [
+                    "键盘和触控都能完成四方向移动",
+                    "胜利后可以继续游戏，失败后可以重新开始",
+                    "分数与历史最高分正确显示并保存",
+                    "移动端棋盘不横向溢出，自动化测试通过",
+                ],
+            })
+        return self._call("submit_interaction_model", {
+            "title": "目标 Web 应用",
+            "summary": "用户从主页面进入核心功能，完成操作后获得清晰结果反馈。",
+            "pages": [
+                {"id": "home", "name": "主页面", "purpose": "展示产品入口与核心信息"},
+                {"id": "result", "name": "结果区域", "purpose": "反馈用户操作结果"},
+            ],
+            "flows": [
+                {"from": "home", "action": "执行核心操作", "to": "result"},
+                {"from": "result", "action": "返回或再次操作", "to": "home"},
+            ],
+            "states": [
+                {"from": "idle", "event": "用户开始操作", "to": "active"},
+                {"from": "active", "event": "操作完成", "to": "completed"},
+            ],
+            "acceptance_criteria": ["核心流程可以完整走通", "操作结果有清晰反馈", "页面在桌面端和移动端均可使用"],
+        })
+
     def _complete_star_catcher(self, history: list[dict[str, Any]]) -> ModelTurn:
         if not history:
             return self._call("list_files", {"path": ".", "max_depth": 3})
@@ -156,6 +221,18 @@ class DemoModelClient:
             result = json.loads(last.get("content") or "{}")
         except json.JSONDecodeError:
             result = {}
+
+        if name == "finish" and result.get("data", {}).get("checkpoint_kind") == "review":
+            return self._call("read_file", {
+                "path": result.get("data", {}).get("review_path", "src/game.js"),
+                "start_line": 1,
+                "end_line": 200,
+            })
+        if name == "read_file" and self._review_checkpoint_pending(history):
+            return self._call("finish", {
+                "summary": "已修复星星捕手的连击计分错误，并完成改动自检。",
+                "verification": "npm test 通过，并重新读取改动文件确认实现",
+            })
 
         if name == "list_files":
             return self._call("run_command", {"command": "npm test", "timeout": 30})
@@ -190,6 +267,18 @@ class DemoModelClient:
             "summary": "网页游戏演示流程已结束，请检查最后一条工具结果。",
             "verification": "已执行本地工具链",
         })
+
+    @staticmethod
+    def _review_checkpoint_pending(history: list[dict[str, Any]]) -> bool:
+        for message in reversed(history[:-1]):
+            if message.get("name") != "finish":
+                continue
+            try:
+                result = json.loads(message.get("content") or "{}")
+            except json.JSONDecodeError:
+                return False
+            return result.get("data", {}).get("checkpoint_kind") == "review"
+        return False
 
     @staticmethod
     def _call(name: str, arguments: dict[str, Any]) -> ModelTurn:

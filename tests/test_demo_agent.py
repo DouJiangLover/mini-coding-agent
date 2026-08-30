@@ -37,14 +37,23 @@ def test_demo_agent_repairs_and_verifies_project(tmp_path: Path):
     assert "return a + b" in (workspace / "src" / "calculator.py").read_text(encoding="utf-8")
     assert record.successful_commands == ["pytest -q"]
     assert event_store.get("run_test").terminal
-    plan_events = [event for event in event_store.get("run_test").events if event["type"] == "plan_updated"]
+    run_events = event_store.get("run_test").events
+    plan_events = [event for event in run_events if event["type"] == "plan_updated"]
     assert plan_events[0]["payload"]["items"][0]["status"] == "running"
     assert plan_events[-1]["payload"]["items"][-1]["status"] == "success"
+    assert any(event["type"] == "quality_checkpoint" for event in run_events)
+    assert any(event["phase"] == "reviewing" for event in run_events)
+    assert not any(event["type"] == "error" and event["payload"].get("tool") == "run_command" for event in run_events)
 
 
 def test_demo_agent_repairs_star_catcher_combo(tmp_path: Path):
     workspace = tmp_path / "star-catcher"
     shutil.copytree(EXAMPLES_ROOT / "star-catcher", workspace)
+    game_source = workspace / "src" / "game.js"
+    game_source.write_text(
+        game_source.read_text(encoding="utf-8").replace("    combo: nextCombo,\n", "    combo: 0,\n", 1),
+        encoding="utf-8",
+    )
     event_store = EventStore(tmp_path / "events")
     event_store.create("run_game")
     record = RunRecord("run_game", "修复当前工作区中失败的测试", "star-catcher")
@@ -56,3 +65,4 @@ def test_demo_agent_repairs_star_catcher_combo(tmp_path: Path):
     assert "combo: nextCombo" in (workspace / "src" / "game.js").read_text(encoding="utf-8")
     assert record.successful_commands == ["npm test"]
     assert event_store.get("run_game").terminal
+    assert any(event["type"] == "quality_checkpoint" for event in event_store.get("run_game").events)

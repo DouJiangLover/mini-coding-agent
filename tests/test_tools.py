@@ -67,4 +67,66 @@ def test_command_rejects_shell(tmp_path: Path):
     result = asyncio.run(registry.execute("run_command", {"command": "sh -c pwd"}))
 
     assert not result.ok
-    assert "允许列表" in (result.error or "")
+    assert not result.approval_required
+    assert "Shell" in (result.error or "")
+
+
+def test_command_outside_allowlist_requests_approval(tmp_path: Path):
+    registry = ToolRegistry(tmp_path)
+
+    result = asyncio.run(registry.execute("run_command", {"command": "pip --version"}))
+
+    assert not result.ok
+    assert result.approval_required
+    assert result.data["risk"] == "high"
+
+
+def test_skill_permission_can_be_approved_for_one_exact_action(tmp_path: Path):
+    registry = ToolRegistry(tmp_path, allowed_tools=["read_file"])
+    arguments = {"path": "src/audit.py", "content": "def record():\n    return True\n"}
+
+    blocked = asyncio.run(registry.execute("create_file", arguments))
+
+    assert blocked.approval_required
+    assert blocked.data["scope"] == "exact_action_once"
+    assert not (tmp_path / "src" / "audit.py").exists()
+
+    allowed = asyncio.run(registry.execute("create_file", arguments, approved=True))
+
+    assert allowed.ok
+    assert (tmp_path / "src" / "audit.py").is_file()
+
+
+def test_safe_mode_requires_confirmation_for_write_tools(tmp_path: Path):
+    source = tmp_path / "main.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    registry = ToolRegistry(tmp_path, agent_mode="safe")
+    arguments = {"path": "main.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"}
+
+    blocked = asyncio.run(registry.execute("apply_patch", arguments))
+
+    assert blocked.approval_required
+    assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
+    allowed = asyncio.run(registry.execute("apply_patch", arguments, approved=True))
+    assert allowed.ok
+    assert source.read_text(encoding="utf-8") == "VALUE = 2\n"
+
+
+def test_read_only_mode_blocks_file_changes_even_when_approved(tmp_path: Path):
+    registry = ToolRegistry(tmp_path, agent_mode="read_only")
+    arguments = {"path": "created.py", "content": "VALUE = 1\n"}
+
+    result = asyncio.run(registry.execute("create_file", arguments, approved=True))
+
+    assert not result.ok
+    assert result.data["agent_mode_blocked"] is True
+    assert not (tmp_path / "created.py").exists()
+
+
+def test_autonomous_mode_opens_safe_skill_outside_tools(tmp_path: Path):
+    registry = ToolRegistry(tmp_path, allowed_tools=["read_file", "finish"], agent_mode="autonomous")
+
+    result = asyncio.run(registry.execute("create_file", {"path": "created.py", "content": "VALUE = 1\n"}))
+
+    assert result.ok
+    assert (tmp_path / "created.py").is_file()

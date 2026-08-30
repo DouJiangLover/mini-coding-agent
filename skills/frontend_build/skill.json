@@ -2,12 +2,14 @@
   "name": "frontend_build",
   "display_name": "Frontend Build Skill",
   "description": "从需求文档出发，在空工作区中规划、创建并验证一个完整的前端项目。",
-  "keywords": ["需求文档", "从零", "实现", "制作", "搭建", "新建项目", "小游戏", "2048", "前端页面", "build from requirements"],
+  "keywords": ["需求文档", "从零", "制作", "搭建", "新建项目", "小游戏", "2048", "前端页面", "小程序", "网站", "Web 应用", "build from requirements"],
   "allowed_tools": ["list_files", "read_file", "search_text", "create_file", "apply_patch", "run_command", "finish"],
   "plan": [
     {"id": "inspect", "title": "读取需求与验收标准", "status": "running"},
+    {"id": "baseline", "title": "确认工作区与可用验证方式", "status": "pending"},
     {"id": "diagnose", "title": "规划结构与测试策略", "status": "pending"},
     {"id": "edit", "title": "创建完整项目文件", "status": "pending"},
-    {"id": "verify", "title": "运行测试并修复问题", "status": "pending"}
+    {"id": "verify", "title": "运行测试并修复问题", "status": "pending"},
+    {"id": "review", "title": "审查需求覆盖与关键实现", "status": "pending"}
   ]
 }

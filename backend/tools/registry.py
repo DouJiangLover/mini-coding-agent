@@ -28,6 +28,7 @@ class ToolResult:
     data: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     truncated: bool = False
+    approval_required: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -36,13 +37,34 @@ class ToolResult:
             "data": self.data,
             "error": self.error,
             "truncated": self.truncated,
+            "approval_required": self.approval_required,
         }
 
 
+class ToolApprovalRequired(ValueError):
+    def __init__(self, reason: str, *, risk: str = "medium") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.risk = risk
+
+
 class ToolRegistry:
-    def __init__(self, workspace: Path, allowed_tools: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        allowed_tools: list[str] | None = None,
+        *,
+        agent_mode: str = "standard",
+        max_command_timeout: int = 60,
+    ) -> None:
         self.guard = WorkspaceGuard(workspace)
         self.allowed_tools = set(allowed_tools or self.available_names())
+        self.agent_mode = agent_mode
+        self.max_command_timeout = max(1, min(int(max_command_timeout), 60))
+        self.forced_approval_tools = {"create_file", "apply_patch", "run_command"} if agent_mode == "safe" else set()
+        self.blocked_tools = {"create_file", "apply_patch"} if agent_mode == "read_only" else set()
+        if agent_mode == "autonomous":
+            self.allowed_tools = set(self.available_names())
         self._handlers: dict[str, Callable[..., Any]] = {
             "list_files": self.list_files,
             "read_file": self.read_file,
@@ -83,23 +105,77 @@ class ToolRegistry:
             }, required=["path", "old_text", "new_text"]),
             _schema("run_command", "在工作区运行一个受控的开发命令，不支持 shell 管道。", {
                 "command": {"type": "string", "description": "例如 pytest -q 或 npm test"},
-                "timeout": {"type": "integer", "description": "超时秒数，1 到 60，默认 30"},
+                "timeout": {"type": "integer", "description": f"超时秒数，1 到 {self.max_command_timeout}"},
             }, required=["command"]),
             _schema("finish", "任务完成或无法继续时提交最终结果。", {
                 "summary": {"type": "string", "description": "面向用户的完成总结"},
                 "verification": {"type": "string", "description": "验证方式和结果"},
             }, required=["summary"]),
         ]
-        return [schema for schema in schemas if schema["function"]["name"] in self.allowed_tools]
+        for schema in schemas:
+            name = schema["function"]["name"]
+            if name in self.blocked_tools:
+                schema["function"]["description"] += " 当前为只读模式，此工具已被禁止。"
+            elif name in self.forced_approval_tools:
+                schema["function"]["description"] += " 当前为安全模式，调用时需要用户单次授权。"
+            elif name not in self.allowed_tools:
+                schema["function"]["description"] += " 当前 Skill 未默认开放，调用时需要用户单次授权。"
+        return schemas
 
-    async def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
-        if name not in self.allowed_tools or name not in self._handlers:
-            return ToolResult(False, f"工具 {name} 不可用", error="工具不存在或当前 Skill 没有权限")
+    async def execute(self, name: str, arguments: dict[str, Any], *, approved: bool = False) -> ToolResult:
+        if name not in self._handlers:
+            return ToolResult(False, f"工具 {name} 不可用", error="工具不存在")
+        if name in self.blocked_tools:
+            return ToolResult(
+                False,
+                f"{name} 在只读模式下不可用",
+                data={"agent_mode_blocked": True, "agent_mode": self.agent_mode},
+                error="当前 Agent 配置为只读模式，不能创建或修改文件",
+            )
+        if name in self.forced_approval_tools and not approved:
+            return ToolResult(
+                False,
+                f"安全模式要求确认 {name}",
+                data={
+                    "permission_reason": f"当前 Agent 使用安全模式，执行 {name} 前需要逐次确认。",
+                    "risk": "medium",
+                    "scope": "exact_action_once",
+                },
+                error="安全模式要求用户确认",
+                approval_required=True,
+            )
+        if name not in self.allowed_tools and not approved:
+            return ToolResult(
+                False,
+                f"{name} 需要用户授权",
+                data={
+                    "permission_reason": f"当前 Skill 未默认开放 {name}，需要临时提升工具权限。",
+                    "risk": "medium",
+                    "scope": "exact_action_once",
+                },
+                error="当前 Skill 没有权限",
+                approval_required=True,
+            )
         try:
-            result = self._handlers[name](**arguments)
+            if name == "run_command":
+                result = self.run_command(**arguments, approved=approved)
+            else:
+                result = self._handlers[name](**arguments)
             if asyncio.iscoroutine(result):
                 result = await result
             return result
+        except ToolApprovalRequired as exc:
+            return ToolResult(
+                False,
+                f"{name} 需要用户授权",
+                data={
+                    "permission_reason": exc.reason,
+                    "risk": exc.risk,
+                    "scope": "exact_action_once",
+                },
+                error=exc.reason,
+                approval_required=True,
+            )
         except (TypeError, ValueError, WorkspaceViolation) as exc:
             return ToolResult(False, f"{name} 参数或权限检查失败", error=str(exc))
         except Exception as exc:  # Tool errors must become observations instead of crashing the loop.
@@ -219,11 +295,11 @@ class ToolRegistry:
         diff_text, truncated = _truncate(diff)
         return ToolResult(True, f"已局部修改 {path}", {"path": path, "diff": diff_text}, truncated=truncated)
 
-    async def run_command(self, command: str, timeout: int = 30) -> ToolResult:
-        args = _validate_command(command)
+    async def run_command(self, command: str, timeout: int = 30, *, approved: bool = False) -> ToolResult:
+        args = _validate_command(command, approved=approved)
         if Path(args[0]).name == "pytest":
             args = [sys.executable, "-m", "pytest", *args[1:]]
-        timeout = max(1, min(int(timeout), 60))
+        timeout = max(1, min(int(timeout), self.max_command_timeout))
         process = await asyncio.create_subprocess_exec(
             *args,
             cwd=self.guard.root,
@@ -277,7 +353,7 @@ def _truncate(text: str) -> tuple[str, bool]:
     return f"{head}\n\n... 输出已截断 ...\n\n{tail}", True
 
 
-def _validate_command(command: str) -> list[str]:
+def _validate_command(command: str, *, approved: bool = False) -> list[str]:
     if not command.strip():
         raise ValueError("command 不能为空")
     try:
@@ -288,14 +364,17 @@ def _validate_command(command: str) -> list[str]:
         raise ValueError("command 不能为空")
     executable = Path(args[0]).name
     allowed = {"python", "python3", "pytest", "npm", "node", "ruff", "mypy", "git"}
-    if executable not in allowed:
-        raise ValueError(f"命令 {executable} 不在允许列表中")
-    if executable in {"python", "python3", "node"} and any(arg in {"-c", "-e", "--eval"} for arg in args[1:]):
-        raise ValueError("不允许执行内联脚本")
-    if executable == "git" and (len(args) < 2 or args[1] not in {"status", "diff", "log", "show"}):
-        raise ValueError("只允许只读 git 命令")
-    if executable == "npm" and (len(args) < 2 or args[1] not in {"test", "run"}):
-        raise ValueError("只允许 npm test 或 npm run <script>")
+    if executable in {"sh", "bash", "zsh", "fish", "cmd", "powershell", "pwsh"}:
+        raise ValueError("不允许启动 Shell 解释器")
     if any(arg in {"..", "-rf", "--force", "--delete"} for arg in args[1:]):
         raise ValueError("命令包含高风险参数")
+    if not approved:
+        if executable not in allowed:
+            raise ToolApprovalRequired(f"命令 {executable} 不在默认允许列表中", risk="high")
+        if executable in {"python", "python3", "node"} and any(arg in {"-c", "-e", "--eval"} for arg in args[1:]):
+            raise ToolApprovalRequired("命令包含内联脚本，需要审查具体内容", risk="high")
+        if executable == "git" and (len(args) < 2 or args[1] not in {"status", "diff", "log", "show"}):
+            raise ToolApprovalRequired("命令会修改 Git 状态", risk="high")
+        if executable == "npm" and (len(args) < 2 or args[1] not in {"test", "run"}):
+            raise ToolApprovalRequired("命令可能安装依赖或修改项目配置", risk="high")
     return args

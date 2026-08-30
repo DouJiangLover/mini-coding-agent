@@ -6,9 +6,9 @@ import os
 import shutil
 import uuid
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
@@ -17,9 +17,10 @@ from pydantic import BaseModel, Field
 from backend.agent.loop import AgentLoop
 from backend.events.store import EventStore
 from backend.llm.client import create_model_client
-from backend.skills.router import SkillRouter
+from backend.settings import AGENT_MODES, AgentSettingsStore
+from backend.skills.router import AVAILABLE_SKILL_TOOLS, SkillRouter
 from backend.state import RunRecord, RunStore
-from backend.workspace.guard import WorkspaceViolation, resolve_workspace
+from backend.workspace.guard import WorkspaceViolation, list_workspace_directories, resolve_workspace
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -31,8 +32,9 @@ RUNTIME_ROOT = PROJECT_ROOT / ".tracecoder" / "runs"
 events = EventStore(RUNTIME_ROOT)
 runs = RunStore()
 model = create_model_client()
-skills = SkillRouter(PROJECT_ROOT / "skills")
-agent = AgentLoop(events, skills, model)
+skills = SkillRouter(PROJECT_ROOT / "skills", PROJECT_ROOT / ".tracecoder" / "skill-config.json")
+agent_settings = AgentSettingsStore(PROJECT_ROOT / ".tracecoder" / "agent-settings.json")
+agent = AgentLoop(events, skills, model, settings_store=agent_settings)
 
 app = FastAPI(
     title="TraceCoder API",
@@ -51,6 +53,43 @@ app.add_middleware(
 class CreateRunRequest(BaseModel):
     task: str = Field(min_length=3, max_length=8_000)
     workspace: str = Field(default=".", min_length=1, max_length=500)
+    skill: str = Field(default="auto", min_length=1, max_length=100)
+
+
+class ApprovalDecisionRequest(BaseModel):
+    decision: Literal["allow", "deny"]
+
+
+class InteractionDecisionRequest(BaseModel):
+    decision: Literal["approve", "revise"]
+    feedback: str = Field(default="", max_length=2_000)
+
+
+class SkillSelectionDecisionRequest(BaseModel):
+    skill_name: str = Field(min_length=1, max_length=100)
+
+
+class CreateSkillRequest(BaseModel):
+    display_name: str = Field(min_length=2, max_length=60)
+    description: str = Field(min_length=4, max_length=500)
+    keywords: list[str] = Field(min_length=1, max_length=20)
+    allowed_tools: list[str] = Field(min_length=1, max_length=len(AVAILABLE_SKILL_TOOLS))
+    prompt: str = Field(min_length=10, max_length=4_000)
+
+
+class SkillStatusRequest(BaseModel):
+    enabled: bool
+
+
+class AgentSettingsRequest(BaseModel):
+    mode: Literal["safe", "standard", "autonomous", "read_only"]
+    max_steps: int = Field(ge=5, le=100)
+    failure_limit: int = Field(ge=1, le=10)
+    interaction_first: bool
+    require_verification: bool
+    require_review: bool
+    context_budget: int = Field(ge=12_000, le=200_000)
+    command_timeout: int = Field(ge=5, le=60)
 
 
 @app.get("/api/health")
@@ -63,6 +102,88 @@ async def health() -> dict[str, str]:
     }
 
 
+@app.get("/api/skills")
+async def list_skills() -> dict[str, object]:
+    items = skills.list_public()
+    return {
+        "skills": items,
+        "total": len(items),
+        "enabled": sum(bool(item["enabled"]) for item in items),
+        "available_tools": AVAILABLE_SKILL_TOOLS,
+    }
+
+
+@app.post("/api/skills", status_code=201)
+async def create_skill(body: CreateSkillRequest) -> dict[str, object]:
+    try:
+        skill = skills.create_custom(
+            display_name=body.display_name,
+            description=body.description,
+            keywords=body.keywords,
+            allowed_tools=body.allowed_tools,
+            prompt=body.prompt,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"skill": skill}
+
+
+@app.post("/api/skills/{skill_name}/status")
+async def update_skill_status(skill_name: str, body: SkillStatusRequest) -> dict[str, object]:
+    try:
+        skill = skills.set_enabled(skill_name, body.enabled)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Skill 不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"skill": skill}
+
+
+@app.get("/api/settings")
+async def get_agent_settings() -> dict[str, object]:
+    return {
+        "settings": agent_settings.get().public_dict(),
+        "available_modes": sorted(AGENT_MODES),
+    }
+
+
+@app.post("/api/settings")
+async def update_agent_settings(body: AgentSettingsRequest) -> dict[str, object]:
+    try:
+        updated = agent_settings.update(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"settings": updated.public_dict()}
+
+
+@app.post("/api/settings/reset")
+async def reset_agent_settings() -> dict[str, object]:
+    return {"settings": agent_settings.reset().public_dict()}
+
+
+@app.get("/api/workspaces")
+async def browse_workspaces(path: str = Query(default=".", min_length=1, max_length=500)) -> dict[str, object]:
+    try:
+        current, directories = list_workspace_directories(WORKSPACE_ROOT, path)
+    except WorkspaceViolation as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def relative(directory: Path) -> str:
+        return "." if directory == WORKSPACE_ROOT else directory.relative_to(WORKSPACE_ROOT).as_posix()
+
+    current_path = relative(current)
+    parent_path = None if current == WORKSPACE_ROOT else relative(current.parent)
+    return {
+        "root_path": str(WORKSPACE_ROOT),
+        "current": current_path,
+        "parent": parent_path,
+        "directories": [
+            {"name": directory.name, "path": relative(directory)}
+            for directory in directories
+        ],
+    }
+
+
 @app.post("/api/runs", status_code=202)
 async def create_run(body: CreateRunRequest) -> dict[str, str]:
     try:
@@ -70,12 +191,72 @@ async def create_run(body: CreateRunRequest) -> dict[str, str]:
     except WorkspaceViolation as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    normalized_workspace = "." if workspace == WORKSPACE_ROOT else workspace.relative_to(WORKSPACE_ROOT).as_posix()
+    if runs.has_active_workspace(normalized_workspace):
+        raise HTTPException(
+            status_code=409,
+            detail="该工作区已有任务正在运行，请等待完成或先停止任务；其他工作区仍可并行运行",
+        )
+
+    if body.skill != "auto":
+        try:
+            skills.match_enabled(body.skill)
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail="指定的 Skill 不存在或已停用") from exc
+
     run_id = f"run_{uuid.uuid4().hex[:12]}"
-    record = RunRecord(run_id=run_id, task=body.task.strip(), workspace=body.workspace)
+    record = RunRecord(
+        run_id=run_id,
+        task=body.task.strip(),
+        workspace=normalized_workspace,
+        requested_skill=body.skill,
+    )
     runs.add(record)
     events.create(run_id)
     record.background_task = asyncio.create_task(agent.run(record, workspace), name=run_id)
     return {"run_id": run_id, "status": record.status, "mode": model.mode_name}
+
+
+@app.get("/api/runs")
+async def list_runs() -> dict[str, object]:
+    items: list[dict[str, object]] = []
+    for record in runs.list_recent():
+        channel = events.get(record.run_id)
+        run_events = channel.events if channel else []
+        plan_event = next(
+            (
+                event for event in reversed(run_events)
+                if event.get("type") == "plan_updated" and isinstance(event.get("payload", {}).get("items"), list)
+            ),
+            None,
+        )
+        plan_items = plan_event["payload"]["items"] if plan_event else []
+        completed_steps = sum(item.get("status") == "success" for item in plan_items if isinstance(item, dict))
+        last_event = run_events[-1] if run_events else None
+        items.append({
+            "run_id": record.run_id,
+            "task": record.task,
+            "workspace": record.workspace,
+            "status": record.status,
+            "phase": record.phase,
+            "summary": record.summary,
+            "created_at": record.created_at,
+            "completed_steps": completed_steps,
+            "total_steps": len(plan_items),
+            "changed_files": len(record.changed_files),
+            "last_event": {
+                "type": last_event.get("type"),
+                "title": last_event.get("title"),
+                "summary": last_event.get("summary"),
+                "timestamp": last_event.get("timestamp"),
+            } if last_event else None,
+        })
+    attention_statuses = {"waiting_skill_confirmation", "waiting_approval", "waiting_interaction_confirmation"}
+    return {
+        "runs": items,
+        "active": sum(str(item["status"]) in {"created", "running", *attention_statuses} for item in items),
+        "attention": sum(str(item["status"]) in attention_statuses for item in items),
+    }
 
 
 @app.get("/api/runs/{run_id}")
@@ -122,7 +303,65 @@ async def cancel_run(run_id: str) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="任务不存在")
     if record.status not in {"completed", "failed", "cancelled"}:
         record.cancel_requested = True
-    return {"run_id": run_id, "status": "cancelling" if record.status == "running" else record.status}
+        if record.pending_skill_selection:
+            record.resolve_skill_confirmation(
+                str(record.pending_skill_selection["selection_id"]), "cancelled",
+            )
+        if record.pending_approval:
+            record.resolve_approval(str(record.pending_approval["approval_id"]), "cancelled")
+        if record.pending_interaction:
+            record.resolve_interaction_confirmation(
+                str(record.pending_interaction["model_id"]), "cancelled",
+            )
+    active = record.status in {"created", "running", "waiting_skill_confirmation", "waiting_approval", "waiting_interaction_confirmation"}
+    return {"run_id": run_id, "status": "cancelling" if active else record.status}
+
+
+@app.post("/api/runs/{run_id}/approvals/{approval_id}")
+async def resolve_approval(run_id: str, approval_id: str, body: ApprovalDecisionRequest) -> dict[str, str]:
+    record = runs.get(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if record.status != "waiting_approval" or not record.pending_approval:
+        raise HTTPException(status_code=409, detail="当前任务没有等待处理的授权请求")
+    if not record.resolve_approval(approval_id, body.decision):
+        raise HTTPException(status_code=409, detail="授权请求已失效或不属于当前任务")
+    return {"run_id": run_id, "approval_id": approval_id, "decision": body.decision}
+
+
+@app.post("/api/runs/{run_id}/skill-selection/{selection_id}")
+async def resolve_skill_selection(
+    run_id: str,
+    selection_id: str,
+    body: SkillSelectionDecisionRequest,
+) -> dict[str, str]:
+    record = runs.get(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if record.status != "waiting_skill_confirmation" or not record.pending_skill_selection:
+        raise HTTPException(status_code=409, detail="当前任务没有等待确认的 Skill 候选")
+    if not record.resolve_skill_confirmation(selection_id, body.skill_name):
+        raise HTTPException(status_code=409, detail="Skill 候选已失效或选择无效")
+    return {"run_id": run_id, "selection_id": selection_id, "skill_name": body.skill_name}
+
+
+@app.post("/api/runs/{run_id}/interaction/{model_id}")
+async def resolve_interaction_confirmation(
+    run_id: str,
+    model_id: str,
+    body: InteractionDecisionRequest,
+) -> dict[str, str]:
+    record = runs.get(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if record.status != "waiting_interaction_confirmation" or not record.pending_interaction:
+        raise HTTPException(status_code=409, detail="当前任务没有等待确认的交互流程")
+    feedback = body.feedback.strip()
+    if body.decision == "revise" and not feedback:
+        raise HTTPException(status_code=400, detail="请说明需要如何调整交互流程")
+    if not record.resolve_interaction_confirmation(model_id, body.decision, feedback):
+        raise HTTPException(status_code=409, detail="交互流程确认请求已失效或不属于当前任务")
+    return {"run_id": run_id, "model_id": model_id, "decision": body.decision}
 
 
 @app.post("/api/demo/reset")
@@ -153,6 +392,24 @@ async def reset_demo(workspace: str = "examples/calculator") -> dict[str, str]:
             backup_root.mkdir(parents=True, exist_ok=False)
             for entry in generated_entries:
                 shutil.move(str(entry), str(backup_root / entry.name))
+    elif workspace == "examples/approval-demo":
+        demo_workspace = resolve_workspace(PROJECT_ROOT, workspace)
+        fixture = PROJECT_ROOT / "fixtures" / "approval-demo"
+        if not fixture.is_dir():
+            raise HTTPException(status_code=409, detail="Approval Demo 基线不存在，无法安全重置")
+        backup_root = PROJECT_ROOT / ".tracecoder" / "reset-backups" / f"approval-demo-{uuid.uuid4().hex[:10]}"
+        backup_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(demo_workspace), str(backup_root))
+        shutil.copytree(fixture, demo_workspace)
+    elif workspace == "examples/order-engine-lab":
+        demo_workspace = resolve_workspace(PROJECT_ROOT, workspace)
+        fixture = PROJECT_ROOT / "fixtures" / "order-engine-lab"
+        if not fixture.is_dir():
+            raise HTTPException(status_code=409, detail="Failure Lab 基线不存在，无法安全重置")
+        backup_root = PROJECT_ROOT / ".tracecoder" / "reset-backups" / f"order-lab-{uuid.uuid4().hex[:10]}"
+        backup_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(demo_workspace), str(backup_root))
+        shutil.copytree(fixture, demo_workspace)
     else:
         raise HTTPException(status_code=400, detail="仅支持重置内置演示项目")
     return {"status": "reset", "workspace": workspace}
