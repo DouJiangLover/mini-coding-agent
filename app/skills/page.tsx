@@ -1,7 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import Link from 'next/link';
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 
 type SkillItem = {
   name: string;
@@ -70,7 +69,9 @@ export default function SkillManagerPage() {
   const [query, setQuery] = useState('');
   const [showCreate, setShowCreate] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [form, setForm] = useState<SkillForm>(EMPTY_FORM);
+  const skillFileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -173,15 +174,47 @@ export default function SkillManagerPage() {
     }
   }
 
+  async function importSkillFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file || importing) return;
+    setError('');
+    setNotice('');
+    if (file.size > 1_000_000) {
+      setError('Skill 文件不能超过 1 MB。');
+      event.target.value = '';
+      return;
+    }
+
+    setImporting(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/skills/import?filename=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file,
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const data = await response.json() as { skill: SkillItem; format: string };
+      setSkills((current) => [...current, data.skill]);
+      setFilter('custom');
+      setQuery('');
+      setNotice(`${data.skill.display_name} 已从 ${data.format} 导入并启用，可以参与下一个任务的 Skill 路由。`);
+    } catch (importError) {
+      setError(importError instanceof Error ? importError.message : '无法导入 Skill 文件');
+    } finally {
+      setImporting(false);
+      event.target.value = '';
+    }
+  }
+
   return (
     <main className="skill-manager-shell">
       <header className="skill-manager-topbar">
-        <Link className="skill-brand" href="/" aria-label="返回 TraceCoder 工作台">
-          <span>›_</span><strong>TraceCoder</strong>
-        </Link>
+        <a className="skill-brand" href="/" aria-label="返回 IntentFlow 工作台">
+          <span>›_</span><strong>IntentFlow</strong>
+        </a>
         <div className="manager-topbar-links">
-          <Link className="back-to-workspace" href="/settings"><span>⚙</span> Agent 设置</Link>
-          <Link className="back-to-workspace" href="/"><span>←</span> 返回工作台</Link>
+          <a className="back-to-workspace" href="/settings"><span>⚙</span> Agent 设置</a>
+          <a className="back-to-workspace" href="/"><span>←</span> 返回工作台</a>
         </div>
       </header>
 
@@ -190,11 +223,28 @@ export default function SkillManagerPage() {
           <div>
             <span className="page-kicker">AGENT CAPABILITIES</span>
             <h1>Skill 管理</h1>
-            <p>决定 Agent 可以选择哪些工作策略，也可以创建适合你项目习惯的自定义能力。</p>
+            <p>决定 Agent 可以组合哪些工作策略。自动模式会按任务选择最多三项互补 Skill；交互流程由独立需求分析器控制。</p>
           </div>
-          <button className="create-skill-button" type="button" onClick={() => { setShowCreate(true); setError(''); }}>
-            <span>＋</span> 添加 Skill
-          </button>
+          <div className="skill-manager-heading-actions">
+            <div>
+              <input
+                ref={skillFileInputRef}
+                className="skill-file-input"
+                type="file"
+                accept=".zip,.json,.md,.markdown,application/zip,application/json,text/markdown"
+                onChange={(event) => void importSkillFile(event)}
+                disabled={importing}
+                aria-label="选择要导入的 Skill 文件"
+              />
+              <button className="import-skill-button" type="button" onClick={() => skillFileInputRef.current?.click()} disabled={importing}>
+                <span>⇧</span> {importing ? '正在导入…' : '导入 Skill 文件'}
+              </button>
+              <button className="create-skill-button" type="button" onClick={() => { setShowCreate(true); setError(''); }}>
+                <span>＋</span> 添加 Skill
+              </button>
+            </div>
+            <small>支持 ZIP、JSON 和 SKILL.md，最大 1 MB</small>
+          </div>
         </section>
 
         <section className="skill-stat-grid" aria-label="Skill 统计">

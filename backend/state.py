@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import PurePosixPath
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,6 +14,12 @@ class RunRecord:
     task: str
     workspace: str
     requested_skill: str = "auto"
+    root_task: str = ""
+    parent_run_id: str | None = None
+    continuation_context: dict[str, Any] | None = None
+    session_id: str = ""
+    session_entry_id: str = ""
+    parent_entry_id: str | None = None
     status: str = "created"
     phase: str = "created"
     summary: str = ""
@@ -20,7 +27,11 @@ class RunRecord:
     cancel_requested: bool = False
     background_task: asyncio.Task[Any] | None = None
     changed_files: list[str] = field(default_factory=list)
+    read_files: list[str] = field(default_factory=list)
     successful_commands: list[str] = field(default_factory=list)
+    traceability: dict[str, Any] | None = None
+    user_guide_path: str = ""
+    steering_messages: list[dict[str, Any]] = field(default_factory=list)
     pending_approval: dict[str, Any] | None = None
     approval_future: asyncio.Future[str] | None = field(default=None, repr=False)
     pending_interaction: dict[str, Any] | None = None
@@ -28,18 +39,31 @@ class RunRecord:
     pending_skill_selection: dict[str, Any] | None = None
     skill_selection_future: asyncio.Future[str] | None = field(default=None, repr=False)
 
+    def __post_init__(self) -> None:
+        if not self.root_task:
+            self.root_task = self.task
+
     def public_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "task": self.task,
             "workspace": self.workspace,
             "requested_skill": self.requested_skill,
+            "root_task": self.root_task,
+            "parent_run_id": self.parent_run_id,
+            "session_id": self.session_id,
+            "session_entry_id": self.session_entry_id,
+            "parent_entry_id": self.parent_entry_id,
             "status": self.status,
             "phase": self.phase,
             "summary": self.summary,
             "created_at": self.created_at,
             "changed_files": self.changed_files,
+            "read_files": self.read_files,
             "successful_commands": self.successful_commands,
+            "traceability": self.traceability,
+            "user_guide_path": self.user_guide_path,
+            "steering_messages": self.steering_messages,
             "pending_approval": self.pending_approval,
             "pending_interaction": self.pending_interaction,
             "pending_skill_selection": self.pending_skill_selection,
@@ -114,6 +138,34 @@ class RunRecord:
         self.pending_skill_selection = None
         self.skill_selection_future = None
 
+    def enqueue_steering(self, message: str) -> dict[str, Any]:
+        pending = sum(item.get("status") == "queued" for item in self.steering_messages)
+        if pending >= 20:
+            raise ValueError("待处理的 Steering 消息过多，请等待 Agent 消化后再发送")
+        item = {
+            "steering_id": f"steer_{uuid.uuid4().hex[:12]}",
+            "message": message.strip(),
+            "status": "queued",
+            "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
+            "applied_at": "",
+        }
+        self.steering_messages.append(item)
+        return item
+
+    def take_pending_steering(self) -> list[dict[str, Any]]:
+        applied: list[dict[str, Any]] = []
+        applied_at = datetime.now(timezone.utc).astimezone().isoformat()
+        for item in self.steering_messages:
+            if item.get("status") != "queued":
+                continue
+            item["status"] = "applied"
+            item["applied_at"] = applied_at
+            applied.append(dict(item))
+        return applied
+
+    def has_pending_steering(self) -> bool:
+        return any(item.get("status") == "queued" for item in self.steering_messages)
+
 
 class RunStore:
     def __init__(self) -> None:
@@ -127,6 +179,52 @@ class RunStore:
 
     def list_recent(self) -> list[RunRecord]:
         return sorted(self._runs.values(), key=lambda run: run.created_at, reverse=True)
+
+    def latest_for_workspace(self, workspace: str) -> RunRecord | None:
+        return next((run for run in self.list_recent() if run.workspace == workspace), None)
+
+    def restore(self, channels: list[Any]) -> None:
+        for channel in channels:
+            run_events = channel.events
+            started = next((event for event in run_events if event.get("type") == "run_started"), None)
+            if not started:
+                continue
+            payload = started.get("payload", {})
+            finished = next(
+                (event for event in reversed(run_events) if event.get("type") == "run_finished"),
+                None,
+            )
+            finished_payload = finished.get("payload", {}) if finished else {}
+            task = str(payload.get("task", "")).strip()
+            workspace = str(payload.get("workspace", ".")).strip() or "."
+            if not task:
+                continue
+            record = RunRecord(
+                run_id=str(started.get("run_id", channel.run_id)),
+                task=task,
+                workspace=workspace,
+                requested_skill=str(payload.get("requested_skill", "auto")),
+                root_task=str(payload.get("root_task", task)),
+                parent_run_id=str(payload["parent_run_id"]) if payload.get("parent_run_id") else None,
+                continuation_context=payload.get("continuation_context") if isinstance(payload.get("continuation_context"), dict) else None,
+                session_id=str(payload.get("session_id", "")),
+                session_entry_id=str(payload.get("session_entry_id", "")),
+                parent_entry_id=str(payload["parent_entry_id"]) if payload.get("parent_entry_id") else None,
+                status=str(finished_payload.get("status", "failed")),
+                phase=str(finished.get("phase", "failed")) if finished else "failed",
+                summary=str(finished.get("summary", "任务已中断")) if finished else "任务已中断",
+                created_at=str(started.get("timestamp", "")),
+                changed_files=[str(item) for item in finished_payload.get("changed_files", [])],
+                read_files=[str(item) for item in finished_payload.get("read_files", [])],
+                successful_commands=[str(item) for item in finished_payload.get("successful_commands", [])],
+                traceability=finished_payload.get("traceability") if isinstance(finished_payload.get("traceability"), dict) else None,
+                user_guide_path=str(finished_payload.get("user_guide_path", "")),
+                steering_messages=[
+                    dict(item) for item in finished_payload.get("steering_messages", [])
+                    if isinstance(item, dict)
+                ],
+            )
+            self.add(record)
 
     def has_active_workspace(self, workspace: str) -> bool:
         return any(

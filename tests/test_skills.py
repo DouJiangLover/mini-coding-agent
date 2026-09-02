@@ -28,6 +28,15 @@ def test_router_selects_frontend_build_skill():
     assert "2048" in match.matched_keywords
 
 
+def test_router_recognizes_plain_language_web_product_request():
+    match = SkillRouter(SKILLS_ROOT).select(
+        "帮我创建一个网页的系统，帮助用户记录分类标记和复习知识卡片"
+    )
+
+    assert match.skill.name == "frontend_build"
+    assert "网页" in match.matched_keywords
+
+
 def test_router_persists_disabled_skill(tmp_path: Path):
     config = tmp_path / "skill-config.json"
     router = SkillRouter(SKILLS_ROOT, config)

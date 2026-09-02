@@ -1,6 +1,6 @@
 # Approval Demo
 
-这是一个专门演示 TraceCoder 单次授权机制的小项目。
+这是一个专门演示 IntentFlow 单次授权机制的小项目。
 
 当前收据模块依赖 `src/formatter.py`，但这个文件故意缺失，因此测试会在收集阶段失败。任务会匹配 Bug Fix Skill，而该 Skill 不默认开放 `create_file`。Agent 定位问题并尝试创建缺失文件时，应暂停并向用户申请一次授权。
 

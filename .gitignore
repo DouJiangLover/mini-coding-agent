@@ -30,8 +30,10 @@ yarn-error.log*
 .env*
 !.env.example
 
-# TraceCoder runtime
+# IntentFlow runtime (legacy directory kept ignored for seamless migration)
+/.intentflow/
 /.tracecoder/
+/workspaces/
 __pycache__/
 .pytest_cache/
 *.py[cod]
@@ -45,3 +47,8 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# Local Finder copies and disposable demo snapshots
+/app/globals 2.css
+/app/page 2.tsx
+/examples/approval-demo 2/

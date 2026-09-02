@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 WORKSPACE_BROWSER_SKIPPED_NAMES = {
-    ".git", ".idea", ".next", ".tracecoder", ".venv", ".vscode",
+    ".git", ".idea", ".next", ".intentflow", ".tracecoder", ".venv", ".vscode",
     "__pycache__", "build", "dist", "node_modules", "venv",
 }
 
@@ -45,7 +45,7 @@ def resolve_workspace(project_root: Path, requested: str) -> Path:
     root = project_root.resolve()
     candidate = (root / requested).resolve()
     if candidate != root and root not in candidate.parents:
-        raise WorkspaceViolation("工作区越过了 TRACE_WORKSPACE_ROOT")
+        raise WorkspaceViolation("工作区越过了 INTENTFLOW_WORKSPACE_ROOT")
     if not candidate.is_dir():
         raise WorkspaceViolation(f"工作区不存在：{requested}")
     return candidate

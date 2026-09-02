@@ -3,7 +3,7 @@ import json
 import uuid
 from pathlib import Path
 
-from backend.agent.loop import AgentLoop
+from backend.agent.loop import AgentLoop, _normalize_interaction_model, _should_create_interaction_model
 from backend.events.store import EventStore
 from backend.llm.client import ModelTurn, ToolCall
 from backend.skills.router import SkillRouter
@@ -58,6 +58,76 @@ class InteractionFlowModel:
             "用户已经确认以下产品交互模型" in str(message.get("content") or "")
             for message in messages
         )
+        history = [message for message in messages if message.get("role") == "tool"]
+        requirement_ids = ["AC-01", "AC-02"]
+        if not history:
+            return self._call("list_files", {"path": ".", "max_depth": 2})
+        last = history[-1]
+        try:
+            result = json.loads(last.get("content") or "{}")
+        except json.JSONDecodeError:
+            result = {}
+        if last.get("name") == "list_files":
+            return self._call("create_file", {
+                "path": "index.html",
+                "content": (
+                    "<!doctype html><title>番茄钟</title>"
+                    "<button>开始</button><button>暂停</button><button>继续</button>"
+                    "<p>专注完成</p>"
+                ),
+                "requirement_ids": requirement_ids,
+            })
+        if last.get("name") == "create_file":
+            path = str(result.get("data", {}).get("path", ""))
+            if path == "index.html":
+                return self._call("create_file", {
+                    "path": "test_timer.py",
+                    "content": (
+                        "from pathlib import Path\n\n"
+                        "def test_timer_controls_and_completion():\n"
+                        "    page = Path('index.html').read_text(encoding='utf-8')\n"
+                        "    assert all(label in page for label in ('开始', '暂停', '继续', '专注完成'))\n"
+                    ),
+                    "requirement_ids": requirement_ids,
+                })
+            if path == "README.md":
+                return self._call("read_file", {
+                    "path": "README.md",
+                    "start_line": 1,
+                    "end_line": 120,
+                })
+            return self._call("run_command", {
+                "command": "python3 -m pytest -q",
+                "timeout": 10,
+                "requirement_ids": requirement_ids,
+            })
+        if last.get("name") == "finish" and result.get("data", {}).get("checkpoint_kind") == "review":
+            return self._call("read_file", {
+                "path": "index.html",
+                "start_line": 1,
+                "end_line": 20,
+                "requirement_ids": requirement_ids,
+            })
+        if last.get("name") == "finish" and result.get("data", {}).get("checkpoint_kind") == "verify":
+            return self._call("run_command", {
+                "command": "python3 -m pytest -q",
+                "timeout": 10,
+                "requirement_ids": requirement_ids,
+            })
+        if last.get("name") == "finish" and result.get("data", {}).get("checkpoint_kind") == "user_guide":
+            instruction = str(result.get("data", {}).get("instruction", ""))
+            if "创建或更新" in instruction:
+                return self._call("create_file", {
+                    "path": "README.md",
+                    "content": (
+                        "# 番茄钟\n\n## 项目简介与主要功能\n在浏览器中进行专注计时。\n\n"
+                        "## 环境准备\n使用现代浏览器，无需安装依赖。\n\n"
+                        "## 启动方法\n双击 index.html。\n\n"
+                        "## 使用说明\n点击开始，可暂停和继续。\n\n"
+                        "## 常见问题与注意事项\n页面异常时刷新浏览器。\n"
+                    ),
+                })
+            return self._call("read_file", {"path": "README.md", "start_line": 1, "end_line": 120})
         return self._call("finish", {"summary": "已按确认的交互模型完成任务", "verification": "流程已确认"})
 
     @staticmethod
@@ -91,7 +161,7 @@ def test_agent_waits_for_interaction_confirmation_before_implementation(tmp_path
         events.create("run_interaction")
         record = RunRecord("run_interaction", "请按照需求文档从零实现一个番茄钟小程序", ".")
         model = InteractionFlowModel()
-        loop = AgentLoop(events, SkillRouter(SKILLS_ROOT), model, max_steps=3)
+        loop = AgentLoop(events, SkillRouter(SKILLS_ROOT), model, max_steps=14)
         task = asyncio.create_task(loop.run(record, tmp_path))
 
         pending = await wait_for_interaction(record)
@@ -113,6 +183,14 @@ def test_agent_waits_for_interaction_confirmation_before_implementation(tmp_path
     assert "interaction_model_created" in event_types
     assert "interaction_confirmation_requested" in event_types
     assert "interaction_confirmation_resolved" in event_types
+    assert "traceability_initialized" in event_types
+    assert "traceability_updated" in event_types
+    assert record.traceability is not None
+    assert record.traceability["verified"] == 2
+    assert record.traceability["coverage_percent"] == 100
+    assert record.user_guide_path == "README.md"
+    assert (tmp_path / "README.md").is_file()
+    assert "user_guide_ready" in event_types
 
 
 def test_user_feedback_regenerates_interaction_model(tmp_path: Path) -> None:
@@ -122,7 +200,7 @@ def test_user_feedback_regenerates_interaction_model(tmp_path: Path) -> None:
         events.create("run_revision")
         record = RunRecord("run_revision", "根据需求文档从零制作番茄钟前端页面", ".")
         model = InteractionFlowModel()
-        loop = AgentLoop(events, SkillRouter(SKILLS_ROOT), model, max_steps=3)
+        loop = AgentLoop(events, SkillRouter(SKILLS_ROOT), model, max_steps=14)
         task = asyncio.create_task(loop.run(record, tmp_path))
 
         first = await wait_for_interaction(record)
@@ -143,9 +221,96 @@ def test_user_feedback_regenerates_interaction_model(tmp_path: Path) -> None:
     assert model.interaction_calls == 2
     assert channel is not None
     assert [event["type"] for event in channel.events].count("interaction_model_created") == 2
+    feedback_events = [event for event in channel.events if event["type"] == "user_requirement_received"]
+    assert len(feedback_events) == 1
+    assert feedback_events[0]["payload"]["message"] == "增加设置页"
     decisions = [
         event["payload"]["decision"]
         for event in channel.events
         if event["type"] == "interaction_confirmation_resolved"
     ]
     assert decisions == ["revise", "approve"]
+
+
+def test_interaction_model_is_filtered_by_task_and_workspace(tmp_path: Path) -> None:
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    (fresh / "REQUIREMENTS.md").write_text("# 新网站需求\n", encoding="utf-8")
+    build = RunRecord("run_build", "请根据需求文档从零实现一个知识卡片网页系统", "fresh")
+
+    enabled, reason_code, _reason = _should_create_interaction_model(build, fresh)
+
+    assert enabled is True
+    assert reason_code == "greenfield_product_build"
+
+    brief = RunRecord("run_brief", "继续完成这个项目", "fresh")
+    enabled, reason_code, _reason = _should_create_interaction_model(brief, fresh)
+    assert enabled is True
+    assert reason_code == "requirements_backed_build"
+
+
+def test_natural_language_web_request_starts_interaction_first(tmp_path: Path) -> None:
+    """普通用户说“我想做一个网页”时，也必须先确认交互流程。"""
+    (tmp_path / "REQUIREMENTS.md").write_text("", encoding="utf-8")
+    record = RunRecord(
+        "run_natural_language",
+        "我想做一个适合学生使用的小组任务协作网页，帮助大家记录课程项目中的任务。",
+        ".",
+    )
+
+    enabled, reason_code, _reason = _should_create_interaction_model(record, tmp_path)
+
+    assert enabled is True
+    assert reason_code == "greenfield_product_build"
+
+
+def test_empty_source_directory_does_not_skip_interaction_first(tmp_path: Path) -> None:
+    """只有空的 src 目录时仍视为新项目，而不是已有实现。"""
+    (tmp_path / "src").mkdir()
+    record = RunRecord("run_empty_src", "我想做一个简单网页", ".")
+
+    enabled, reason_code, _reason = _should_create_interaction_model(record, tmp_path)
+
+    assert enabled is True
+    assert reason_code == "greenfield_product_build"
+
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    (existing / "package.json").write_text("{}", encoding="utf-8")
+    maintenance = RunRecord("run_maintenance", "优化页面字体并修复按钮样式", "existing")
+    enabled, reason_code, _reason = _should_create_interaction_model(maintenance, existing)
+    assert enabled is False
+    assert reason_code == "maintenance_task"
+
+    explicit = RunRecord("run_explicit", "先为这次改版生成页面流转流程图", "existing")
+    enabled, reason_code, _reason = _should_create_interaction_model(explicit, existing)
+    assert enabled is True
+    assert reason_code == "explicit_request"
+
+
+def test_interaction_model_rejects_duplicate_flow_edges() -> None:
+    arguments = {
+        "title": "知识卡片",
+        "summary": "用户创建并复习卡片。",
+        "pages": [
+            {"id": "list", "name": "卡片列表", "purpose": "查看和筛选卡片"},
+            {"id": "editor", "name": "卡片编辑", "purpose": "创建一张卡片"},
+        ],
+        "flows": [
+            {"from": "list", "action": "点击新建卡片", "to": "editor"},
+            {"from": "list", "action": "点击新建卡片", "to": "editor"},
+        ],
+        "states": [{"from": "empty", "event": "创建卡片", "to": "active"}],
+        "acceptance_criteria": [{
+            "description": "可以创建卡片",
+            "priority": "must",
+            "verification": "automated_test",
+        }],
+    }
+
+    try:
+        _normalize_interaction_model(arguments)
+    except ValueError as exc:
+        assert "重复" in str(exc)
+    else:
+        raise AssertionError("重复页面流转应被拒绝并要求模型重新生成")

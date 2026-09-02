@@ -13,7 +13,7 @@ AGENT_MODES = {"safe", "standard", "autonomous", "read_only"}
 @dataclass(frozen=True)
 class AgentSettings:
     mode: str = "standard"
-    max_steps: int = 30
+    max_steps: int = 45
     failure_limit: int = 3
     interaction_first: bool = True
     require_verification: bool = True
@@ -86,7 +86,7 @@ class AgentSettingsStore:
 
         return AgentSettings(
             mode=mode,
-            max_steps=bounded_integer("max_steps", 30, 5, 100),
+            max_steps=bounded_integer("max_steps", 45, 5, 100),
             failure_limit=bounded_integer("failure_limit", 3, 1, 10),
             interaction_first=boolean("interaction_first", True),
             require_verification=boolean("require_verification", True),

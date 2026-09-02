@@ -2,7 +2,14 @@ from pathlib import Path
 
 import pytest
 
+from backend.agent.loop import AgentLoop
+from backend.events.store import EventStore
+from backend.llm.client import DemoModelClient
 from backend.settings import AgentSettingsStore
+from backend.skills.router import SkillRouter
+
+
+SKILLS_ROOT = Path(__file__).resolve().parents[1] / "skills"
 
 
 def test_agent_settings_persist_and_reload(tmp_path: Path) -> None:
@@ -45,5 +52,22 @@ def test_agent_settings_reset_to_defaults(tmp_path: Path) -> None:
     reset = store.reset()
 
     assert reset.mode == "standard"
-    assert reset.max_steps == 30
+    assert reset.max_steps == 45
     assert reset.require_verification is True
+
+
+def test_saved_step_budget_overrides_environment_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INTENTFLOW_MAX_STEPS", "30")
+    store = AgentSettingsStore(tmp_path / "agent-settings.json")
+    loop = AgentLoop(
+        EventStore(tmp_path / "events"),
+        SkillRouter(SKILLS_ROOT),
+        DemoModelClient(),
+        settings_store=store,
+    )
+
+    assert loop._resolve_max_steps(store.get()) == (30, "environment_default")
+
+    saved = store.update({"max_steps": 60})
+
+    assert loop._resolve_max_steps(saved) == (60, "saved_settings")

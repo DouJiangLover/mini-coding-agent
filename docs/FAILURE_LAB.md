@@ -2,7 +2,7 @@
 
 ## 实验目标
 
-Failure Lab 用于验证 TraceCoder 在复杂跨模块故障、工具权限不足和连续执行失败时，是否能够：
+Failure Lab 用于验证 IntentFlow 在复杂跨模块故障、工具权限不足和连续执行失败时，是否能够：
 
 - 根据真实测试输出继续决策；
 - 拒绝绕过工具边界的操作；
@@ -10,7 +10,7 @@ Failure Lab 用于验证 TraceCoder 在复杂跨模块故障、工具权限不�
 - 保留完整错误轨迹；
 - 不对工作区产生未审查的修改。
 
-实验工作区为 `examples/order-engine-lab`，可通过前端侧边栏选择，并使用“重置演示项目”从 `fixtures/order-engine-lab` 恢复基线。
+实验工作区为 `workspaces/order-engine-lab`，可通过前端侧边栏选择；开发调试时也可使用后端重置接口从 `fixtures/order-engine-lab` 恢复基线。
 
 ## 故障组合
 

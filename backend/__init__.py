@@ -1,1 +1,1 @@
-"""TraceCoder backend package."""
+"""IntentFlow backend package."""

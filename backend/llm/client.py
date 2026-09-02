@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -24,6 +25,10 @@ class ModelTurn:
     content: str = ""
 
 
+class ModelRequestError(RuntimeError):
+    """A user-facing model request failure with credentials kept out of logs."""
+
+
 class ModelClient(Protocol):
     mode_name: str
     provider_name: str
@@ -35,6 +40,7 @@ class ModelClient(Protocol):
 
 class OpenAICompatibleClient:
     mode_name = "model"
+    request_attempts = 3
 
     def __init__(self, api_key: str, base_url: str, model: str, provider: str = "openai-compatible") -> None:
         self.api_key = api_key
@@ -51,15 +57,20 @@ class OpenAICompatibleClient:
             "tool_choice": "auto",
             "temperature": 0.1,
         }
+        if len(tools) == 1:
+            required_tool = str(tools[0].get("function", {}).get("name", ""))
+            if required_tool in {"select_skill", "select_skills", "submit_interaction_model"}:
+                payload["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": required_tool},
+                }
         if self.provider_name == "deepseek":
             # DeepSeek V4 enables thinking by default. Non-thinking mode keeps
             # the tool loop OpenAI-compatible without reasoning_content state.
             payload["thinking"] = {"type": "disabled"}
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=20.0)) as client:
-            response = await client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
-            response.raise_for_status()
-            body = response.json()
+        response = await self._post_with_retries(headers, payload)
+        body = response.json()
         message = body["choices"][0]["message"]
         calls: list[ToolCall] = []
         for raw_call in message.get("tool_calls") or []:
@@ -86,6 +97,58 @@ class OpenAICompatibleClient:
             assistant["tool_calls"] = message["tool_calls"]
         return ModelTurn(assistant_message=assistant, tool_calls=calls, content=message.get("content") or "")
 
+    async def _post_with_retries(
+        self,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+    ) -> httpx.Response:
+        endpoint = f"{self.base_url}/chat/completions"
+        for attempt in range(1, self.request_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=20.0)) as client:
+                    response = await client.post(endpoint, headers=headers, json=payload)
+                    response.raise_for_status()
+                    return response
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                retryable = status == 429 or status >= 500
+                if retryable and attempt < self.request_attempts:
+                    await asyncio.sleep(self._retry_delay(attempt))
+                    continue
+                raise ModelRequestError(self._http_error_message(status)) from exc
+            except httpx.TimeoutException as exc:
+                if attempt < self.request_attempts:
+                    await asyncio.sleep(self._retry_delay(attempt))
+                    continue
+                raise ModelRequestError(
+                    f"模型服务连续 {self.request_attempts} 次响应超时，请检查网络后重试。"
+                ) from exc
+            except httpx.RequestError as exc:
+                if attempt < self.request_attempts:
+                    await asyncio.sleep(self._retry_delay(attempt))
+                    continue
+                raise ModelRequestError(
+                    f"连续 {self.request_attempts} 次无法连接模型服务，请检查网络或稍后重试。"
+                ) from exc
+
+        raise ModelRequestError("模型请求未能完成，请稍后重试。")
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        return 0.6 * (2 ** (attempt - 1))
+
+    @staticmethod
+    def _http_error_message(status: int) -> str:
+        if status in {401, 403}:
+            return "模型服务拒绝认证，请检查 DeepSeek API Key 是否有效且已正确加载。"
+        if status == 402:
+            return "模型账户余额不足，请充值后重新运行任务。"
+        if status == 429:
+            return "模型服务当前请求过多，自动重试后仍未恢复，请稍后再试。"
+        if status >= 500:
+            return f"模型服务暂时不可用（HTTP {status}），自动重试后仍未恢复。"
+        return f"模型服务拒绝了请求（HTTP {status}），请检查模型与接口配置。"
+
 
 class DemoModelClient:
     """Deterministic local planner used only when no API key is configured.
@@ -105,6 +168,11 @@ class DemoModelClient:
             for message in messages
             if message.get("role") == "user"
         ).lower()
+        system_text = "\n".join(
+            str(message.get("content") or "")
+            for message in messages
+            if message.get("role") == "system"
+        )
         tool_names = {
             str(tool.get("function", {}).get("name", ""))
             for tool in tools
@@ -112,15 +180,35 @@ class DemoModelClient:
         }
         if "submit_interaction_model" in tool_names:
             return self._interaction_model(task_text)
+        if "用户已经确认以下产品交互模型" in system_text:
+            raise ModelRequestError(
+                "本地演示模式只提供 calculator 和 star-catcher 的确定性修复闭环；"
+                "从需求文档构建新产品请配置 DeepSeek 或其他 OpenAI-compatible 模型。"
+            )
+        if "load_skill" in tool_names and not any(message.get("name") == "load_skill" for message in history):
+            load_schema = next(
+                tool for tool in tools
+                if tool.get("function", {}).get("name") == "load_skill"
+            )
+            candidates = (
+                load_schema.get("function", {})
+                .get("parameters", {})
+                .get("properties", {})
+                .get("skill_name", {})
+                .get("enum", [])
+            )
+            if candidates:
+                return self._call("load_skill", {"skill_name": str(candidates[0])})
+        actionable_history = [message for message in history if message.get("name") != "load_skill"]
         history_text = "\n".join(str(message.get("content") or "") for message in history).lower()
         is_star_workspace = all(marker in history_text for marker in ("package.json", "game.js", "game.test.js"))
         if "星星捕手" in task_text or "star-catcher" in task_text or "combo" in task_text or is_star_workspace:
-            return self._complete_star_catcher(history)
+            return self._complete_star_catcher(actionable_history)
 
-        if not history:
+        if not actionable_history:
             return self._call("list_files", {"path": ".", "max_depth": 3})
 
-        last = history[-1]
+        last = actionable_history[-1]
         name = last.get("name", "")
         try:
             result = json.loads(last.get("content") or "{}")
@@ -298,12 +386,16 @@ def create_model_client() -> ModelClient:
     deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     generic_api_key = os.getenv("LLM_API_KEY", "").strip()
     api_key = deepseek_api_key or generic_api_key
-    demo_setting = os.getenv("TRACECODER_DEMO", "auto").strip().lower()
+    demo_setting = (
+        os.getenv("INTENTFLOW_DEMO")
+        or os.getenv("TRACECODER_DEMO")
+        or "auto"
+    ).strip().lower()
     use_demo = demo_setting in {"1", "true", "yes"} or (demo_setting == "auto" and not api_key)
     if use_demo:
         return DemoModelClient()
     if not api_key:
-        raise RuntimeError("模型模式需要设置 DEEPSEEK_API_KEY（或 LLM_API_KEY）；也可将 TRACECODER_DEMO 设为 true")
+        raise RuntimeError("模型模式需要设置 DEEPSEEK_API_KEY（或 LLM_API_KEY）；也可将 INTENTFLOW_DEMO 设为 true")
 
     base_url = os.getenv("LLM_BASE_URL", "https://api.deepseek.com").strip()
     model = os.getenv("LLM_MODEL", "deepseek-v4-flash").strip()

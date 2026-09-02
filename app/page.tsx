@@ -1,7 +1,6 @@
 'use client';
 
-import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import Link from 'next/link';
+import { type FormEvent, type KeyboardEvent, useCallback, useEffect, useRef, useState } from 'react';
 
 type RunEvent = {
   event_id: number;
@@ -19,6 +18,7 @@ type PlanItem = {
   id: string;
   title: string;
   status: 'pending' | 'running' | 'success' | 'failed';
+  covers?: string[];
 };
 
 type RunStatus = 'idle' | 'running' | 'waiting_skill_confirmation' | 'waiting_approval' | 'waiting_interaction_confirmation' | 'completed' | 'failed' | 'cancelled';
@@ -48,16 +48,91 @@ type InteractionModel = {
   pages: { id: string; name: string; purpose: string }[];
   flows: { from: string; action: string; to: string }[];
   states: { from: string; event: string; to: string }[];
-  acceptance_criteria: string[];
+  acceptance_criteria: Array<AcceptanceCriterion | string>;
+};
+
+type AcceptanceCriterion = {
+  id: string;
+  description: string;
+  priority: 'must' | 'should';
+  verification: 'automated_test' | 'build_check' | 'human_review';
+};
+
+type RequirementEvidence = {
+  evidence_id: string;
+  evidence_type: 'implementation' | 'verification' | 'review';
+  tool: string;
+  passed: boolean;
+  summary: string;
+  artifact?: string;
+  command?: string;
+  association_source: 'explicit' | 'plan_fallback';
+  timestamp: string;
+};
+
+type TracedRequirement = AcceptanceCriterion & {
+  requirement_id: string;
+  status: 'pending' | 'implemented' | 'verified' | 'failed';
+  evidence: RequirementEvidence[];
+};
+
+type TraceabilitySnapshot = {
+  active: boolean;
+  total: number;
+  verified: number;
+  coverage_percent: number;
+  counts: Record<'pending' | 'implemented' | 'verified' | 'failed', number>;
+  requirements: TracedRequirement[];
+};
+
+type HookPipelineSnapshot = {
+  before?: { decision?: string; hook?: string };
+  after?: string[];
 };
 
 type RunSnapshot = {
   run_id: string;
   task: string;
+  root_task?: string;
+  parent_run_id?: string | null;
   workspace: string;
   requested_skill?: string;
   status: string;
   events?: RunEvent[];
+  conversation?: ConversationTurn[];
+  session_id?: string;
+  session_entry_id?: string;
+  parent_entry_id?: string | null;
+  session_tree?: SessionTree | null;
+};
+
+type ConversationTurn = {
+  run_id: string;
+  session_entry_id?: string;
+  parent_entry_id?: string | null;
+  task: string;
+  status: string;
+  summary: string;
+  created_at: string;
+};
+
+type SessionTreeEntry = ConversationTurn & {
+  entry_id: string;
+  parent_id: string | null;
+  root_task: string;
+  changed_files: string[];
+  successful_commands: string[];
+  depth: number;
+  child_count: number;
+  active: boolean;
+};
+
+type SessionTree = {
+  session_id: string;
+  workspace: string;
+  root_task: string;
+  active_entry_id: string;
+  entries: SessionTreeEntry[];
 };
 
 type StoredRun = {
@@ -98,18 +173,20 @@ type WorkspaceListing = {
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://127.0.0.1:8000';
-const RUN_SESSION_KEY = 'tracecoder:last-run';
+const RUN_SESSION_KEY = 'intentflow:last-run';
+const LEGACY_RUN_SESSION_KEY = 'tracecoder:last-run';
 const ACTIVE_TASK_STATUSES = ['created', 'running', 'waiting_skill_confirmation', 'waiting_approval', 'waiting_interaction_confirmation'];
 
 const PHASES = [
-  { id: 'selecting_skill', label: '选择 Skill' },
   { id: 'interaction_modeling', label: '交互建模' },
   { id: 'interaction_confirmation', label: '确认流程' },
+  { id: 'selecting_skill', label: '组合 Skill' },
   { id: 'planning', label: '制定计划' },
   { id: 'inspecting', label: '理解项目' },
   { id: 'reproducing', label: '建立基线' },
   { id: 'diagnosing', label: '定位根因' },
   { id: 'implementing', label: '实施修改' },
+  { id: 'documenting', label: '编写说明' },
   { id: 'verifying', label: '运行验证' },
   { id: 'reviewing', label: '完成前自检' },
   { id: 'completed', label: '完成' },
@@ -125,11 +202,11 @@ const IDLE_PLAN: PlanItem[] = [
 ];
 
 const PROJECT_WORKSPACES = [
-  { icon: '∑', name: 'Calculator', path: 'examples/calculator', stack: 'Python · pytest' },
-  { icon: '★', name: 'Star Catcher', path: 'examples/star-catcher', stack: 'HTML · CSS · JavaScript' },
-  { icon: '20', name: '2048 Game', path: 'examples/2048-game', stack: '需求文档 · 从零构建' },
-  { icon: '✓', name: 'Approval Demo', path: 'examples/approval-demo', stack: 'Python · 单次授权演示' },
-  { icon: '!', name: 'Failure Lab', path: 'examples/order-engine-lab', stack: 'Python · 复杂故障实验' },
+  { icon: '∑', name: 'Calculator', path: 'calculator', stack: 'Python · pytest' },
+  { icon: '★', name: 'Star Catcher', path: 'star-catcher', stack: 'HTML · CSS · JavaScript' },
+  { icon: '20', name: '2048 Game', path: '2048-game', stack: '需求文档 · 从零构建' },
+  { icon: '✓', name: 'Approval Demo', path: 'approval-demo', stack: 'Python · 单次授权演示' },
+  { icon: '!', name: 'Failure Lab', path: 'order-engine-lab', stack: 'Python · 复杂故障实验' },
 ];
 
 const EVENT_ICONS: Record<string, string> = {
@@ -150,6 +227,13 @@ const EVENT_ICONS: Record<string, string> = {
   interaction_confirmation_requested: '?',
   interaction_confirmation_resolved: '✓',
   quality_checkpoint: 'Q',
+  traceability_initialized: 'AC',
+  traceability_updated: 'AC',
+  user_guide_ready: 'R',
+  steering_received: '↗',
+  steering_applied: '✓',
+  steering_deferred_completion: '↗',
+  user_requirement_received: '✦',
   error: '!',
   run_finished: '✓',
 };
@@ -194,6 +278,18 @@ function eventIcon(event?: RunEvent) {
   return EVENT_ICONS[event.type] ?? '·';
 }
 
+function hookLabel(name: string) {
+  return ({
+    hook_pipeline: '执行前检查通过',
+    argument_validation: '参数校验',
+    repeated_call_guard: '重复动作守卫',
+    quality_preflight: '质量前置关卡',
+    user_guide_delivery: '终端用户文档关卡',
+    traceability_evidence: '需求证据收集',
+    run_observation: '运行状态归档',
+  } as Record<string, string>)[name] ?? name;
+}
+
 function normalizeRunStatus(status: string): RunStatus {
   if (status === 'waiting_skill_confirmation' || status === 'waiting_approval' || status === 'waiting_interaction_confirmation' || status === 'completed' || status === 'failed' || status === 'cancelled') return status;
   return 'running';
@@ -230,60 +326,150 @@ function needsAttention(status: string) {
 
 type DiagramNode = { id: string; title: string; subtitle?: string };
 type DiagramEdge = { from: string; to: string; label: string };
-type PositionedNode = DiagramNode & { x: number; y: number; depth: number };
+type PositionedNode = DiagramNode & { x: number; y: number; depth: number; order: number };
+
+const DIAGRAM_NODE_WIDTH = 210;
+const DIAGRAM_NODE_HEIGHT = 92;
+const DIAGRAM_COLUMN_GAP = 70;
+const DIAGRAM_ROW_GAP = 92;
+const DIAGRAM_MAX_COLUMNS = 3;
 
 function createDiagramLayout(nodes: DiagramNode[], edges: DiagramEdge[]) {
+  if (!nodes.length) return { width: 760, height: 240, nodes: [] as PositionedNode[], layers: [] as { depth: number; y: number }[] };
   const adjacency = new Map(nodes.map((node) => [node.id, [] as string[]]));
+  const predecessors = new Map(nodes.map((node) => [node.id, [] as string[]]));
   const indegree = new Map(nodes.map((node) => [node.id, 0]));
+  const originalIndex = new Map(nodes.map((node, index) => [node.id, index]));
   edges.forEach((edge) => {
     if (edge.from === edge.to || !adjacency.has(edge.from) || !indegree.has(edge.to)) return;
-    adjacency.get(edge.from)?.push(edge.to);
+    const targets = adjacency.get(edge.from);
+    if (targets && !targets.includes(edge.to)) {
+      targets.push(edge.to);
+      predecessors.get(edge.to)?.push(edge.from);
+    }
     indegree.set(edge.to, (indegree.get(edge.to) ?? 0) + 1);
   });
 
+  const depthById = new Map<string, number>();
+  const queue: string[] = [];
   const roots = nodes.filter((node) => indegree.get(node.id) === 0);
-  const queue = (roots.length ? roots : nodes.slice(0, 1)).map((node) => node.id);
-  const depths = new Map(queue.map((id) => [id, 0]));
+  (roots.length ? roots : nodes.slice(0, 1)).forEach((node) => {
+    depthById.set(node.id, 0);
+    queue.push(node.id);
+  });
   while (queue.length) {
     const current = queue.shift();
-    if (!current) break;
-    for (const target of adjacency.get(current) ?? []) {
-      if (depths.has(target)) continue;
-      depths.set(target, (depths.get(current) ?? 0) + 1);
-      queue.push(target);
+    if (!current) continue;
+    const nextDepth = (depthById.get(current) ?? 0) + 1;
+    [...(adjacency.get(current) ?? [])]
+      .sort((first, second) => (originalIndex.get(first) ?? 0) - (originalIndex.get(second) ?? 0))
+      .forEach((target) => {
+        if (depthById.has(target)) return;
+        depthById.set(target, nextDepth);
+        queue.push(target);
+      });
+  }
+  nodes.forEach((node) => {
+    if (depthById.has(node.id)) return;
+    depthById.set(node.id, 0);
+    queue.push(node.id);
+    while (queue.length) {
+      const current = queue.shift();
+      if (!current) continue;
+      const nextDepth = (depthById.get(current) ?? 0) + 1;
+      (adjacency.get(current) ?? []).forEach((target) => {
+        if (depthById.has(target)) return;
+        depthById.set(target, nextDepth);
+        queue.push(target);
+      });
+    }
+  });
+
+  const maxDepth = Math.max(...depthById.values());
+  const groupedIds = Array.from({ length: maxDepth + 1 }, (_, depth) => nodes
+    .filter((node) => depthById.get(node.id) === depth)
+    .sort((first, second) => (originalIndex.get(first.id) ?? 0) - (originalIndex.get(second.id) ?? 0))
+    .map((node) => node.id));
+
+  // A few forward/backward barycentric sweeps keep branches near their
+  // parents and reduce crossings without adding a graph-layout SDK.
+  for (let pass = 0; pass < 4; pass += 1) {
+    for (let depth = 1; depth <= maxDepth; depth += 1) {
+      const previousOrder = new Map(groupedIds[depth - 1].map((id, index) => [id, index]));
+      groupedIds[depth].sort((first, second) => {
+        const score = (id: string) => {
+          const positions = (predecessors.get(id) ?? [])
+            .map((parent) => previousOrder.get(parent))
+            .filter((value): value is number => value !== undefined);
+          return positions.length ? positions.reduce((sum, value) => sum + value, 0) / positions.length : originalIndex.get(id) ?? 0;
+        };
+        return score(first) - score(second) || (originalIndex.get(first) ?? 0) - (originalIndex.get(second) ?? 0);
+      });
+    }
+    for (let depth = maxDepth - 1; depth >= 0; depth -= 1) {
+      const nextOrder = new Map(groupedIds[depth + 1].map((id, index) => [id, index]));
+      groupedIds[depth].sort((first, second) => {
+        const score = (id: string) => {
+          const positions = (adjacency.get(id) ?? [])
+            .map((child) => nextOrder.get(child))
+            .filter((value): value is number => value !== undefined);
+          return positions.length ? positions.reduce((sum, value) => sum + value, 0) / positions.length : originalIndex.get(id) ?? 0;
+        };
+        return score(first) - score(second) || (originalIndex.get(first) ?? 0) - (originalIndex.get(second) ?? 0);
+      });
     }
   }
 
-  let fallbackDepth = Math.max(0, ...depths.values()) + 1;
-  nodes.forEach((node) => {
-    if (!depths.has(node.id)) depths.set(node.id, fallbackDepth++);
-  });
-  const groups = new Map<number, DiagramNode[]>();
-  nodes.forEach((node) => {
-    const depth = depths.get(node.id) ?? 0;
-    groups.set(depth, [...(groups.get(depth) ?? []), node]);
-  });
-
-  const maxPerLevel = Math.max(1, ...[...groups.values()].map((group) => group.length));
-  const width = Math.max(760, maxPerLevel * 220);
-  const maxDepth = Math.max(0, ...groups.keys());
-  const height = Math.max(270, 130 + maxDepth * 150);
+  const widestLayer = Math.max(...groupedIds.map((group) => group.length));
+  const columns = Math.min(DIAGRAM_MAX_COLUMNS, Math.max(1, widestLayer));
+  const contentWidth = columns * DIAGRAM_NODE_WIDTH + Math.max(0, columns - 1) * DIAGRAM_COLUMN_GAP;
+  const width = Math.max(820, contentWidth + 190);
+  const rowStep = DIAGRAM_NODE_HEIGHT + DIAGRAM_ROW_GAP;
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const positioned: PositionedNode[] = [];
-  groups.forEach((group, depth) => {
-    group.forEach((node, index) => {
+  const layerLayouts: { depth: number; y: number; startY: number; rows: number }[] = [];
+  let cursorY = 92;
+  groupedIds.forEach((ids, depth) => {
+    const rows = Math.ceil(ids.length / DIAGRAM_MAX_COLUMNS);
+    const startY = cursorY;
+    ids.forEach((id, order) => {
+      const row = Math.floor(order / DIAGRAM_MAX_COLUMNS);
+      const rowStart = row * DIAGRAM_MAX_COLUMNS;
+      const rowCount = Math.min(DIAGRAM_MAX_COLUMNS, ids.length - rowStart);
+      const column = order % DIAGRAM_MAX_COLUMNS;
+      const offset = (column - (rowCount - 1) / 2) * (DIAGRAM_NODE_WIDTH + DIAGRAM_COLUMN_GAP);
       positioned.push({
-        ...node,
+        ...(nodeById.get(id) as DiagramNode),
         depth,
-        x: ((index + 1) * width) / (group.length + 1),
-        y: 65 + depth * 150,
+        order,
+        x: width / 2 + offset,
+        y: startY + row * rowStep,
       });
     });
+    layerLayouts.push({ depth, y: startY + ((rows - 1) * rowStep) / 2, startY, rows });
+    cursorY += rows * rowStep + 46;
   });
-  return { width, height, nodes: positioned };
+  positioned.sort((first, second) => first.depth - second.depth || first.order - second.order);
+  return {
+    width,
+    height: Math.max(270, cursorY - 46 + DIAGRAM_NODE_HEIGHT / 2 + 32),
+    nodes: positioned,
+    layers: layerLayouts.map(({ depth, y }) => ({ depth, y })),
+  };
 }
 
-function shortDiagramText(value: string, maxLength: number) {
-  return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
+function diagramTextLines(value: string, lineLength: number, maxLines: number) {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  const lines: string[] = [];
+  let cursor = 0;
+  while (cursor < normalized.length && lines.length < maxLines) {
+    lines.push(normalized.slice(cursor, cursor + lineLength));
+    cursor += lineLength;
+  }
+  if (cursor < normalized.length && lines.length) {
+    lines[lines.length - 1] = `${lines[lines.length - 1].slice(0, -1)}…`;
+  }
+  return lines;
 }
 
 function NodeFlowDiagram({
@@ -299,68 +485,136 @@ function NodeFlowDiagram({
 }) {
   const layout = createDiagramLayout(nodes, edges);
   const nodeMap = new Map(layout.nodes.map((node) => [node.id, node]));
-  const nodeWidth = 180;
-  const nodeHeight = 68;
+  const [focusedNode, setFocusedNode] = useState<string>();
+  const [zoom, setZoom] = useState(1);
+  const [showSecondary, setShowSecondary] = useState(false);
+  const renderedWidth = Math.round(layout.width * zoom);
+  const validEdges = edges.filter((edge) => nodeMap.has(edge.from) && nodeMap.has(edge.to));
+  const secondaryEdges = validEdges.filter((edge) => {
+    const source = nodeMap.get(edge.from);
+    const target = nodeMap.get(edge.to);
+    return source && target && (source.id === target.id || target.depth <= source.depth);
+  });
+  const visibleEdges = showSecondary ? validEdges : validEdges.filter((edge) => !secondaryEdges.includes(edge));
+  const focusedTitle = focusedNode ? nodeMap.get(focusedNode)?.title : undefined;
 
   return (
-    <div className="flowchart-scroll">
-      <svg
-        className="node-flowchart"
-        viewBox={`0 0 ${layout.width} ${layout.height}`}
-        style={{ minWidth: `${Math.min(layout.width, 760)}px` }}
-        role="img"
-        aria-label={label}
-      >
+    <div className="flowchart-shell">
+      <div className="flowchart-toolbar">
+        <span>{focusedTitle ? `正在查看：${focusedTitle} 的直接流转` : '主路径 · 点击页面聚焦，回路按需展开'}</span>
+        <div>
+          {focusedNode && <button type="button" onClick={() => setFocusedNode(undefined)}>显示全部</button>}
+          {secondaryEdges.length > 0 && (
+            <button
+              type="button"
+              className="flowchart-toggle"
+              onClick={() => setShowSecondary((value) => !value)}
+              aria-pressed={showSecondary}
+            >
+              {showSecondary ? '隐藏回路' : `显示回路（${secondaryEdges.length}）`}
+            </button>
+          )}
+          <button type="button" aria-label="缩小流程图" onClick={() => setZoom((value) => Math.max(.75, Number((value - .25).toFixed(2))))} disabled={zoom <= .75}>−</button>
+          <output>{Math.round(zoom * 100)}%</output>
+          <button type="button" aria-label="放大流程图" onClick={() => setZoom((value) => Math.min(1.5, Number((value + .25).toFixed(2))))} disabled={zoom >= 1.5}>＋</button>
+        </div>
+      </div>
+      <div className="flowchart-scroll">
+        <svg
+          className="node-flowchart"
+          viewBox={`0 0 ${layout.width} ${layout.height}`}
+          style={{ width: `${renderedWidth}px`, minWidth: '100%' }}
+          role="img"
+          aria-label={label}
+        >
         <defs>
           <marker id={markerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
             <path d="M0,0 L8,4 L0,8 Z" />
           </marker>
         </defs>
 
+        <g className="diagram-layers" aria-hidden="true">
+          {layout.layers.map((layer) => (
+            <g transform={`translate(0, ${layer.y})`} key={layer.depth}>
+              <line x1="34" x2={layout.width - 34} />
+              <text x="42" y={-DIAGRAM_NODE_HEIGHT / 2 - 15}>阶段 {layer.depth + 1}</text>
+            </g>
+          ))}
+        </g>
+
         <g className="diagram-edges">
-          {edges.map((edge, index) => {
+          {visibleEdges.map((edge) => {
             const source = nodeMap.get(edge.from);
             const target = nodeMap.get(edge.to);
             if (!source || !target) return null;
+            const sourceEdges = visibleEdges.filter((item) => item.from === edge.from);
+            const targetEdges = visibleEdges.filter((item) => item.to === edge.to);
+            const sourceSlot = sourceEdges.indexOf(edge) - (sourceEdges.length - 1) / 2;
+            const targetSlot = targetEdges.indexOf(edge) - (targetEdges.length - 1) / 2;
+            const sourceOffset = sourceSlot * Math.min(22, 92 / Math.max(1, sourceEdges.length));
+            const targetOffset = targetSlot * Math.min(22, 92 / Math.max(1, targetEdges.length));
             let path = '';
             let labelX = (source.x + target.x) / 2;
             let labelY = (source.y + target.y) / 2;
 
             if (source.id === target.id) {
-              const selfLoopIndex = edges.slice(0, index).filter((item) => item.from === edge.from && item.to === edge.to).length;
-              const direction = source.x > layout.width * 0.7
-                ? -1
-                : source.x < layout.width * 0.3 ? 1 : selfLoopIndex % 2 === 0 ? 1 : -1;
-              const reach = 78 + Math.floor(selfLoopIndex / 2) * 30;
-              const side = source.x + direction * (nodeWidth / 2 - 5);
-              path = `M ${side} ${source.y - 18} C ${side + direction * reach} ${source.y - 72}, ${side + direction * reach} ${source.y + 72}, ${side} ${source.y + 18}`;
-              labelX = side + direction * (reach - 17);
-              labelY = source.y;
-            } else if (source.depth === target.depth) {
-              const direction = target.x > source.x ? 1 : -1;
-              const sourceX = source.x + direction * nodeWidth / 2;
-              const targetX = target.x - direction * nodeWidth / 2;
-              const arcY = Math.min(source.y, target.y) - 65 - (index % 2) * 16;
-              path = `M ${sourceX} ${source.y} C ${sourceX + direction * 35} ${arcY}, ${targetX - direction * 35} ${arcY}, ${targetX} ${target.y}`;
-              labelY = arcY + 3;
-            } else {
-              const downward = target.y > source.y;
-              const sourceY = source.y + (downward ? nodeHeight / 2 : -nodeHeight / 2);
-              const targetY = target.y + (downward ? -nodeHeight / 2 : nodeHeight / 2);
+              const selfLoopIndex = visibleEdges.slice(0, visibleEdges.indexOf(edge)).filter((item) => item.from === edge.from && item.to === edge.to).length;
+              const direction = selfLoopIndex % 2 === 0 ? 1 : -1;
+              const sourceX = source.x + direction * DIAGRAM_NODE_WIDTH / 2;
+              const laneX = source.x + direction * (DIAGRAM_NODE_WIDTH / 2 + 60 + selfLoopIndex * 34);
+              path = `M ${sourceX} ${source.y - 20} C ${laneX} ${source.y - 20}, ${laneX} ${source.y + 54}, ${sourceX} ${source.y + 20}`;
+              labelX = laneX;
+              labelY = source.y + 17;
+            } else if (target.depth === source.depth + 1) {
+              const sourceX = source.x + sourceOffset;
+              const targetX = target.x + targetOffset;
+              const sourceY = source.y + DIAGRAM_NODE_HEIGHT / 2;
+              const targetY = target.y - DIAGRAM_NODE_HEIGHT / 2;
               const middleY = (sourceY + targetY) / 2;
-              path = `M ${source.x} ${sourceY} C ${source.x} ${middleY}, ${target.x} ${middleY}, ${target.x} ${targetY}`;
+              path = `M ${sourceX} ${sourceY} C ${sourceX} ${middleY}, ${targetX} ${middleY}, ${targetX} ${targetY}`;
+              labelX = (sourceX + targetX) / 2;
               labelY = middleY;
+            } else if (target.depth === source.depth) {
+              const sameDepthIndex = visibleEdges.slice(0, visibleEdges.indexOf(edge)).filter((item) => {
+                const itemSource = nodeMap.get(item.from);
+                const itemTarget = nodeMap.get(item.to);
+                return itemSource?.depth === source.depth && itemTarget?.depth === source.depth;
+              }).length;
+              const laneY = source.y - DIAGRAM_NODE_HEIGHT / 2 - 28 - (sameDepthIndex % 3) * 22;
+              path = `M ${source.x + sourceOffset} ${source.y - DIAGRAM_NODE_HEIGHT / 2} C ${source.x + sourceOffset} ${laneY}, ${target.x + targetOffset} ${laneY}, ${target.x + targetOffset} ${target.y - DIAGRAM_NODE_HEIGHT / 2}`;
+              labelX = (source.x + target.x) / 2;
+              labelY = laneY;
+            } else {
+              const detourIndex = visibleEdges.slice(0, visibleEdges.indexOf(edge)).filter((item) => {
+                const detourSource = nodeMap.get(item.from);
+                const detourTarget = nodeMap.get(item.to);
+                return Boolean(
+                  detourSource
+                  && detourTarget
+                  && (Math.abs(detourTarget.depth - detourSource.depth) > 1 || detourTarget.depth < detourSource.depth),
+                );
+              }).length;
+              const direction = detourIndex % 2 === 0 ? 1 : -1;
+              const lane = Math.floor(detourIndex / 2);
+              const laneX = direction > 0 ? layout.width - 66 - lane * 38 : 66 + lane * 38;
+              const sourceX = source.x + direction * DIAGRAM_NODE_WIDTH / 2;
+              const targetX = target.x + direction * DIAGRAM_NODE_WIDTH / 2;
+              path = `M ${sourceX} ${source.y} C ${laneX} ${source.y}, ${laneX} ${target.y}, ${targetX} ${target.y}`;
+              labelX = laneX;
+              labelY = (source.y + target.y) / 2;
             }
 
-            const displayLabel = shortDiagramText(edge.label, 18);
-            const labelWidth = Math.max(62, Math.min(164, [...displayLabel].length * 9 + 20));
+            const isRelated = !focusedNode || edge.from === focusedNode || edge.to === focusedNode;
+            const isSecondary = secondaryEdges.includes(edge);
+            const edgeNumber = edges.indexOf(edge) + 1;
+
             return (
-              <g className="diagram-edge" key={`${edge.from}-${edge.to}-${index}`}>
+              <g className={`diagram-edge ${isSecondary ? 'secondary-edge' : ''} ${isRelated ? 'is-related' : 'is-muted'}`} key={`${edge.from}-${edge.to}-${edgeNumber}`}>
                 <title>{`${nodeMap.get(edge.from)?.title ?? edge.from} — ${edge.label} → ${nodeMap.get(edge.to)?.title ?? edge.to}`}</title>
                 <path d={path} markerEnd={`url(#${markerId})`} />
-                <g className="edge-label" transform={`translate(${labelX}, ${labelY})`}>
-                  <rect x={-labelWidth / 2} y="-12" width={labelWidth} height="24" rx="12" />
-                  <text textAnchor="middle" dominantBaseline="central">{displayLabel}</text>
+                <g className="edge-label edge-number" transform={`translate(${labelX}, ${labelY})`}>
+                  <circle r="12" />
+                  <text textAnchor="middle" dominantBaseline="central">{edgeNumber}</text>
                 </g>
               </g>
             );
@@ -369,17 +623,38 @@ function NodeFlowDiagram({
 
         <g className="diagram-nodes">
           {layout.nodes.map((node, index) => (
-            <g className="diagram-node" transform={`translate(${node.x}, ${node.y})`} key={node.id}>
+            <g
+              className={`diagram-node ${focusedNode === node.id ? 'is-focused' : focusedNode ? 'is-muted' : ''}`}
+              transform={`translate(${node.x}, ${node.y})`}
+              role="button"
+              tabIndex={0}
+              aria-pressed={focusedNode === node.id}
+              onClick={() => setFocusedNode((value) => value === node.id ? undefined : node.id)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  setFocusedNode((value) => value === node.id ? undefined : node.id);
+                }
+              }}
+              key={node.id}
+            >
               <title>{node.subtitle ? `${node.title}：${node.subtitle}` : node.title}</title>
-              <rect x={-nodeWidth / 2} y={-nodeHeight / 2} width={nodeWidth} height={nodeHeight} rx="13" />
-              <circle cx={-nodeWidth / 2 + 17} cy={-nodeHeight / 2 + 17} r="9" />
-              <text className="node-index" x={-nodeWidth / 2 + 17} y={-nodeHeight / 2 + 17} textAnchor="middle" dominantBaseline="central">{index + 1}</text>
-              <text className="node-title" x="0" y={node.subtitle ? -5 : 2} textAnchor="middle">{shortDiagramText(node.title, 16)}</text>
-              {node.subtitle && <text className="node-subtitle" x="0" y="16" textAnchor="middle">{shortDiagramText(node.subtitle, 24)}</text>}
+              <rect x={-DIAGRAM_NODE_WIDTH / 2} y={-DIAGRAM_NODE_HEIGHT / 2} width={DIAGRAM_NODE_WIDTH} height={DIAGRAM_NODE_HEIGHT} rx="13" />
+              <circle cx={-DIAGRAM_NODE_WIDTH / 2 + 18} cy={-DIAGRAM_NODE_HEIGHT / 2 + 18} r="10" />
+              <text className="node-index" x={-DIAGRAM_NODE_WIDTH / 2 + 18} y={-DIAGRAM_NODE_HEIGHT / 2 + 18} textAnchor="middle" dominantBaseline="central">{index + 1}</text>
+              <text className="node-title" x="0" y={node.subtitle ? -11 : 3} textAnchor="middle">{diagramTextLines(node.title, 16, 1)[0]}</text>
+              {node.subtitle && (
+                <text className="node-subtitle" x="0" y="12" textAnchor="middle">
+                  {diagramTextLines(node.subtitle, 22, 2).map((line, lineIndex) => (
+                    <tspan x="0" dy={lineIndex === 0 ? 0 : 16} key={`${node.id}-${lineIndex}`}>{line}</tspan>
+                  ))}
+                </text>
+              )}
             </g>
           ))}
         </g>
-      </svg>
+        </svg>
+      </div>
     </div>
   );
 }
@@ -387,7 +662,7 @@ function NodeFlowDiagram({
 export default function Home() {
   const [task, setTask] = useState('');
   const [submittedTask, setSubmittedTask] = useState('');
-  const [workspace, setWorkspace] = useState('examples/calculator');
+  const [workspace, setWorkspace] = useState('calculator');
   const [runId, setRunId] = useState<string>();
   const [runStatus, setRunStatus] = useState<RunStatus>('idle');
   const [events, setEvents] = useState<RunEvent[]>([]);
@@ -403,16 +678,29 @@ export default function Home() {
   const [skillSubmitting, setSkillSubmitting] = useState(false);
   const [approvalSubmitting, setApprovalSubmitting] = useState(false);
   const [interactionSubmitting, setInteractionSubmitting] = useState(false);
+  const [steeringSubmitting, setSteeringSubmitting] = useState(false);
   const [showInteractionFeedback, setShowInteractionFeedback] = useState(false);
   const [interactionFeedback, setInteractionFeedback] = useState('');
   const [taskRuns, setTaskRuns] = useState<TaskSummary[]>([]);
+  const [conversationTurns, setConversationTurns] = useState<ConversationTurn[]>([]);
+  const [sessionId, setSessionId] = useState('');
+  const [sessionTree, setSessionTree] = useState<SessionTree>();
+  const [branchTarget, setBranchTarget] = useState<SessionTreeEntry>();
   const [petOpen, setPetOpen] = useState(false);
   const [petReminder, setPetReminder] = useState('');
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
-  const [workspaceDraft, setWorkspaceDraft] = useState('examples/calculator');
+  const [workspaceDraft, setWorkspaceDraft] = useState('calculator');
   const [workspaceListing, setWorkspaceListing] = useState<WorkspaceListing>();
+  const [workspaceRootDirectories, setWorkspaceRootDirectories] = useState<WorkspaceDirectory[]>();
   const [workspacePickerError, setWorkspacePickerError] = useState('');
   const [workspacePickerLoading, setWorkspacePickerLoading] = useState(false);
+  const [workspaceDeleteTarget, setWorkspaceDeleteTarget] = useState<WorkspaceDirectory>();
+  const [workspaceDeleting, setWorkspaceDeleting] = useState(false);
+  const [workspaceDeleteError, setWorkspaceDeleteError] = useState('');
+  const [workspaceCreateOpen, setWorkspaceCreateOpen] = useState(false);
+  const [workspaceNewName, setWorkspaceNewName] = useState('');
+  const [workspaceCreating, setWorkspaceCreating] = useState(false);
+  const [workspaceCreateError, setWorkspaceCreateError] = useState('');
   const streamRef = useRef<EventSource | null>(null);
   const conversationRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -421,7 +709,14 @@ export default function Home() {
   const taskStatusesRef = useRef<Map<string, string>>(new Map());
   const taskListReadyRef = useRef(false);
   const reminderTimerRef = useRef<number | undefined>(undefined);
-  const knownActiveWorkspace = PROJECT_WORKSPACES.find((item) => item.path === workspace);
+  const availableProjectWorkspaces = workspaceRootDirectories === undefined
+    ? PROJECT_WORKSPACES
+    : PROJECT_WORKSPACES.filter((project) => workspaceRootDirectories.some((directory) => directory.path === project.path));
+  const customProjectWorkspaces = (workspaceRootDirectories ?? [])
+    .filter((directory) => !PROJECT_WORKSPACES.some((project) => project.path === directory.path))
+    .map((directory) => ({ icon: '⌁', name: directory.name, path: directory.path, stack: '本地项目工作区' }));
+  const sidebarProjectWorkspaces = [...availableProjectWorkspaces, ...customProjectWorkspaces];
+  const knownActiveWorkspace = sidebarProjectWorkspaces.find((item) => item.path === workspace);
   const activeWorkspace = knownActiveWorkspace ?? {
     icon: '⌁',
     name: workspace === '.' ? '工作区根目录' : workspace.split('/').filter(Boolean).at(-1) ?? '本地工作区',
@@ -480,6 +775,15 @@ export default function Home() {
       if (event.type === 'run_finished') {
         setRunStatus(normalizeRunStatus(String(event.payload?.status ?? 'completed')));
         stream.close();
+        void fetch(`${API_BASE}/api/runs/${id}`)
+          .then(async (response) => response.ok ? await response.json() as RunSnapshot : undefined)
+          .then((snapshot) => {
+            if (!snapshot) return;
+            setConversationTurns((snapshot.conversation ?? []).slice(0, -1));
+            setSessionId(snapshot.session_id ?? '');
+            setSessionTree(snapshot.session_tree ?? undefined);
+          })
+          .catch(() => undefined);
       }
     };
     stream.onerror = () => {
@@ -505,6 +809,24 @@ export default function Home() {
       })
       .then((data) => setSkillOptions((data.skills ?? []).filter((skill) => skill.enabled)))
       .catch(() => setSkillOptions([]));
+    fetch(`${API_BASE}/api/workspaces?path=.`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error('workspaces unavailable');
+        return await response.json() as WorkspaceListing;
+      })
+      .then((data) => {
+        setWorkspaceRootDirectories(data.directories);
+        setWorkspace((current) => {
+          const stillExists = current === '.' || data.directories.some(
+            (directory) => current === directory.path || current.startsWith(`${directory.path}/`),
+          );
+          if (stillExists) return current;
+          return PROJECT_WORKSPACES.find(
+            (project) => data.directories.some((directory) => directory.path === project.path),
+          )?.path ?? data.directories[0]?.path ?? '.';
+        });
+      })
+      .catch(() => undefined);
     return () => streamRef.current?.close();
   }, []);
 
@@ -551,7 +873,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const storedText = sessionStorage.getItem(RUN_SESSION_KEY);
+    const storedText = sessionStorage.getItem(RUN_SESSION_KEY) ?? sessionStorage.getItem(LEGACY_RUN_SESSION_KEY);
     if (!storedText) return;
 
     let stored: StoredRun;
@@ -560,6 +882,7 @@ export default function Home() {
       if (!stored.runId || !stored.task || !stored.workspace) throw new Error('invalid run session');
     } catch {
       sessionStorage.removeItem(RUN_SESSION_KEY);
+      sessionStorage.removeItem(LEGACY_RUN_SESSION_KEY);
       return;
     }
 
@@ -567,13 +890,17 @@ export default function Home() {
     fetch(`${API_BASE}/api/runs/${stored.runId}`)
       .then(async (response) => {
         if (!response.ok) {
-          if (response.status === 404) sessionStorage.removeItem(RUN_SESSION_KEY);
+          if (response.status === 404) {
+            sessionStorage.removeItem(RUN_SESSION_KEY);
+            sessionStorage.removeItem(LEGACY_RUN_SESSION_KEY);
+            return null;
+          }
           throw new Error(await response.text());
         }
         return await response.json() as RunSnapshot;
       })
       .then((snapshot) => {
-        if (disposed) return;
+        if (disposed || !snapshot) return;
         const restoredEvents = Array.isArray(snapshot.events) ? snapshot.events : [];
         const restoredPlan = [...restoredEvents].reverse().find(
           (event) => event.type === 'plan_updated' && Array.isArray(event.payload?.items),
@@ -588,6 +915,10 @@ export default function Home() {
         setSelectedId(restoredEvents.at(-1)?.event_id);
         if (restoredPlan) setPlan(restoredPlan.payload?.items as PlanItem[]);
         setRunStatus(restoredStatus);
+        setConversationTurns((snapshot.conversation ?? []).slice(0, -1));
+        setSessionId(snapshot.session_id ?? '');
+        setSessionTree(snapshot.session_tree ?? undefined);
+        setBranchTarget(undefined);
         if (isActiveStatus(restoredStatus)) attachStream(snapshot.run_id);
       })
       .catch(() => {
@@ -607,9 +938,11 @@ export default function Home() {
   }, [events.length]);
 
   const activeEvent = events.find((event) => event.event_id === selectedId) ?? events.at(-1);
+  const activeHookPipeline = activeEvent?.payload?.hook_pipeline as HookPipelineSnapshot | undefined;
   const selectedSkill = [...events].reverse().find((event) => event.type === 'skill_selected');
-  const interactionFirst = selectedSkill?.payload?.skill === 'frontend_build'
-    || events.some((event) => event.type.startsWith('interaction_'));
+  const interactionDecision = [...events].reverse().find((event) => event.type === 'interaction_model_decision');
+  const interactionFirst = interactionDecision?.payload?.enabled === true
+    || events.some((event) => ['interaction_model_created', 'interaction_confirmation_requested'].includes(event.type));
   const visiblePhases = interactionFirst
     ? PHASES
     : PHASES.filter((phase) => !['interaction_modeling', 'interaction_confirmation'].includes(phase.id));
@@ -618,6 +951,14 @@ export default function Home() {
     .find((phase) => visiblePhases.some((item) => item.id === phase)) ?? 'created';
   const currentPhaseIndex = visiblePhases.findIndex((phase) => phase.id === currentPhase);
   const finalEvent = [...events].reverse().find((event) => event.type === 'run_finished');
+  const latestTraceabilityEvent = [...events].reverse().find(
+    (event) => ['traceability_updated', 'traceability_initialized'].includes(event.type),
+  );
+  const finalTraceability = finalEvent?.payload?.traceability;
+  const traceability = (
+    latestTraceabilityEvent?.payload
+    ?? (finalTraceability && typeof finalTraceability === 'object' ? finalTraceability : undefined)
+  ) as TraceabilitySnapshot | undefined;
   const completedSteps = plan.filter((item) => item.status === 'success').length;
   const changedFiles = [...new Set(events.filter((event) => event.type === 'file_changed').map((event) => String(event.payload?.path ?? '')))].filter(Boolean);
   const resolvedApprovalIds = new Set(events
@@ -669,19 +1010,32 @@ export default function Home() {
     to: flow.to,
     label: flow.action,
   }));
-  const interactionStateIds = [...new Set((interactionModel?.states ?? []).flatMap((state) => [state.from, state.to]))];
-  const interactionStateNodes: DiagramNode[] = interactionStateIds.map((id) => ({ id, title: id }));
-  const interactionStateEdges: DiagramEdge[] = (interactionModel?.states ?? []).map((state) => ({
-    from: state.from,
-    to: state.to,
-    label: state.event,
-  }));
   const skillTypes = ['skill_candidates', 'skill_confirmation_requested', 'skill_confirmation_resolved', 'skill_selected'];
-  const interactionTypes = ['interaction_context_collected', 'interaction_model_created', 'interaction_confirmation_requested', 'interaction_confirmation_resolved'];
-  const activityEvents = events.filter((event) => [...skillTypes, 'phase_changed', 'tool_finished', 'file_changed', 'quality_checkpoint', 'approval_requested', 'approval_resolved', 'error', ...interactionTypes].includes(event.type));
-  const chatEvents = events.filter((event) => [...skillTypes, 'tool_finished', 'file_changed', 'quality_checkpoint', 'approval_requested', 'approval_resolved', 'error', ...interactionTypes].includes(event.type));
+  const interactionTypes = ['interaction_model_decision', 'interaction_context_collected', 'interaction_model_created', 'interaction_confirmation_requested', 'interaction_confirmation_resolved'];
+  const traceabilityTypes = ['traceability_initialized', 'traceability_updated'];
+  const steeringTypes = ['steering_received', 'steering_applied', 'steering_deferred_completion'];
+  const communicationTypes = [...steeringTypes, 'user_requirement_received'];
+  const activityEvents = events.filter((event) => ['run_started', ...skillTypes, 'phase_changed', 'tool_finished', 'file_changed', 'user_guide_ready', ...communicationTypes, 'quality_checkpoint', 'approval_requested', 'approval_resolved', 'error', ...interactionTypes, ...traceabilityTypes].includes(event.type));
+  // Communication messages have a dedicated, complete record below the
+  // agent introduction; keep the compact execution list focused on actions.
+  const chatEvents = events.filter((event) => ['run_started', ...skillTypes, 'tool_finished', 'file_changed', 'user_guide_ready', 'quality_checkpoint', 'approval_requested', 'approval_resolved', 'error', ...interactionTypes, ...traceabilityTypes].includes(event.type));
+  const steeringAppliedIds = new Set(
+    events
+      .filter((event) => event.type === 'steering_applied')
+      .map((event) => String(event.payload?.steering_id ?? ''))
+      .filter(Boolean),
+  );
+  const communicationEvents = events.filter((event) => {
+    if (communicationTypes.includes(event.type) && event.type !== 'steering_applied') return true;
+    // Keep feedback from runs created before the dedicated requirement event
+    // was introduced visible when their historical event log is reopened.
+    return event.type === 'interaction_confirmation_resolved'
+      && event.payload?.decision === 'revise'
+      && typeof event.payload?.feedback === 'string'
+      && Boolean(event.payload.feedback.trim());
+  });
 
-  const tabContent = useMemo(() => {
+  const tabContent = (() => {
     if (tab === 'diff') {
       const event = [...events].reverse().find((item) => item.type === 'file_changed');
       return typeof event?.payload?.diff === 'string' ? event.payload.diff : '本次任务还没有文件改动。';
@@ -693,9 +1047,9 @@ export default function Home() {
       return outputs.join('\n\n') || '命令输出会显示在这里。';
     }
     return payloadText(activeEvent);
-  }, [activeEvent, events, tab]);
+  })();
 
-  async function openTask(selectedRun: TaskSummary) {
+  async function openTask(selectedRun: Pick<TaskSummary, 'run_id'>) {
     setPetOpen(false);
     if (selectedRun.run_id === runId) return;
     streamRef.current?.close();
@@ -717,6 +1071,10 @@ export default function Home() {
       setSelectedId(restoredEvents.at(-1)?.event_id);
       setPlan(restoredPlan ? restoredPlan.payload?.items as PlanItem[] : IDLE_PLAN);
       setRunStatus(restoredStatus);
+      setConversationTurns((snapshot.conversation ?? []).slice(0, -1));
+      setSessionId(snapshot.session_id ?? '');
+      setSessionTree(snapshot.session_tree ?? undefined);
+      setBranchTarget(undefined);
       setInteractionFeedback('');
       setShowInteractionFeedback(false);
       setSkillChoice('');
@@ -734,6 +1092,15 @@ export default function Home() {
   async function startRun() {
     const submitted = task.trim();
     if (!submitted || isActiveStatus(runStatus)) return;
+    const parentRunId = branchTarget?.run_id
+      ?? (runId && ['completed', 'failed', 'cancelled'].includes(runStatus) ? runId : undefined);
+    const parentTurn = !branchTarget && parentRunId && submittedTask ? {
+      run_id: parentRunId,
+      task: submittedTask,
+      status: runStatus,
+      summary: finalEvent?.summary ?? '',
+      created_at: finalEvent?.timestamp ?? new Date().toISOString(),
+    } satisfies ConversationTurn : undefined;
     setNotice('');
     setSubmittedTask(submitted);
     setEvents([]);
@@ -744,20 +1111,47 @@ export default function Home() {
       const response = await fetch(`${API_BASE}/api/runs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task: submitted, workspace: workspace.trim() || '.', skill: requestedSkill }),
+        body: JSON.stringify({
+          task: submitted,
+          workspace: workspace.trim() || '.',
+          skill: requestedSkill,
+          parent_run_id: parentRunId,
+          session_id: sessionId || undefined,
+          parent_entry_id: branchTarget?.entry_id,
+        }),
       });
       if (!response.ok) throw new Error(await response.text());
-      const data = await response.json() as { run_id: string };
+      const data = await response.json() as { run_id: string; session_id?: string; session_entry_id?: string };
       sessionStorage.setItem(RUN_SESSION_KEY, JSON.stringify({
         runId: data.run_id,
         task: submitted,
         workspace: workspace.trim() || '.',
       } satisfies StoredRun));
       setTask('');
+      if (branchTarget && sessionTree) {
+        const byId = new Map(sessionTree.entries.map((entry) => [entry.entry_id, entry]));
+        const path: SessionTreeEntry[] = [];
+        let cursor: SessionTreeEntry | undefined = branchTarget;
+        while (cursor) {
+          path.push(cursor);
+          cursor = cursor.parent_id ? byId.get(cursor.parent_id) : undefined;
+        }
+        setConversationTurns(path.reverse().map((entry) => ({
+          run_id: entry.run_id,
+          session_entry_id: entry.entry_id,
+          parent_entry_id: entry.parent_id,
+          task: entry.task,
+          status: entry.status,
+          summary: entry.summary,
+          created_at: entry.created_at,
+        })));
+      } else if (parentTurn) setConversationTurns((current) => [...current, parentTurn]);
       setInteractionFeedback('');
       setShowInteractionFeedback(false);
       setSkillChoice('');
       setRunId(data.run_id);
+      setSessionId(data.session_id ?? sessionId);
+      setBranchTarget(undefined);
       attachStream(data.run_id);
     } catch (error) {
       setRunStatus('failed');
@@ -768,6 +1162,27 @@ export default function Home() {
   async function cancelRun() {
     if (!runId) return;
     await fetch(`${API_BASE}/api/runs/${runId}/cancel`, { method: 'POST' });
+  }
+
+  async function sendSteering() {
+    const message = task.trim();
+    if (!runId || runStatus !== 'running' || !message || steeringSubmitting) return;
+    setSteeringSubmitting(true);
+    setNotice('');
+    try {
+      const response = await fetch(`${API_BASE}/api/runs/${runId}/steering`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      setTask('');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '无法发送方向修正');
+    } finally {
+      setSteeringSubmitting(false);
+      composerRef.current?.focus();
+    }
   }
 
   const decideSkillSelection = useCallback(async () => {
@@ -886,16 +1301,6 @@ export default function Home() {
     return () => window.removeEventListener('keydown', handleInteractionKey);
   }, [decideInteraction, interactionSubmitting, pendingInteraction, runStatus, showInteractionFeedback]);
 
-  async function resetDemo() {
-    try {
-      const response = await fetch(`${API_BASE}/api/demo/reset?workspace=${encodeURIComponent(workspace)}`, { method: 'POST' });
-      if (!response.ok) throw new Error(await response.text());
-      setNotice(`${activeWorkspace.name} 工作区已恢复，可以重新运行任务。`);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : '重置失败');
-    }
-  }
-
   async function loadWorkspaceDirectory(path: string) {
     setWorkspacePickerLoading(true);
     setWorkspacePickerError('');
@@ -904,6 +1309,7 @@ export default function Home() {
       const data = await response.json() as WorkspaceListing & { detail?: string };
       if (!response.ok) throw new Error(data.detail || '无法读取该文件夹');
       setWorkspaceListing(data);
+      if (data.current === '.') setWorkspaceRootDirectories(data.directories);
       setWorkspaceDraft(data.current);
     } catch (error) {
       setWorkspacePickerError(error instanceof Error ? error.message : '无法读取该文件夹');
@@ -916,8 +1322,105 @@ export default function Home() {
     setPetOpen(false);
     setWorkspaceDraft(workspace);
     setWorkspacePickerError('');
+    setWorkspaceCreateOpen(false);
+    setWorkspaceCreateError('');
+    setWorkspaceNewName('');
     setWorkspacePickerOpen(true);
     void loadWorkspaceDirectory(workspace);
+  }
+
+  async function createNewWorkspace(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (workspaceCreating) return;
+    const name = workspaceNewName.trim();
+    if (!name) {
+      setWorkspaceCreateError('请输入新项目的文件夹名称。');
+      return;
+    }
+    if (workspaceIsBusy(name)) {
+      setWorkspaceCreateError('该路径与运行中的任务工作区重叠，请稍后再创建。');
+      return;
+    }
+
+    setWorkspaceCreating(true);
+    setWorkspaceCreateError('');
+    try {
+      const response = await fetch(`${API_BASE}/api/workspaces`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      const data = await response.json() as { workspace?: WorkspaceDirectory; detail?: string };
+      if (!response.ok || !data.workspace) throw new Error(data.detail || '无法创建新工作区');
+      const createdWorkspace = data.workspace;
+
+      let rootData: WorkspaceListing | undefined;
+      try {
+        const rootResponse = await fetch(`${API_BASE}/api/workspaces?path=.`);
+        if (rootResponse.ok) rootData = await rootResponse.json() as WorkspaceListing;
+      } catch {
+        // The newly created workspace is still usable; keep the local list in sync below.
+      }
+
+      const previousTaskContinues = Boolean(runId && isActiveStatus(runStatus));
+      const nextDirectories = rootData?.directories
+        ?? [...(workspaceRootDirectories ?? []).filter((directory) => directory.path !== createdWorkspace.path), createdWorkspace];
+      setWorkspaceRootDirectories(nextDirectories);
+      if (rootData) setWorkspaceListing(rootData);
+      setWorkspaceDraft(createdWorkspace.path);
+      setWorkspaceNewName('');
+      setWorkspaceCreateOpen(false);
+      setWorkspacePickerOpen(false);
+      clearCurrentRunForWorkspace(createdWorkspace.path);
+      setNotice(
+        previousTaskContinues
+          ? `原任务会继续在后台运行，已创建并选择 ${createdWorkspace.name} 工作区。`
+          : `已创建空工作区 ${createdWorkspace.name}，请描述要实现的新项目。`,
+      );
+      window.setTimeout(() => composerRef.current?.focus(), 0);
+    } catch (error) {
+      setWorkspaceCreateError(error instanceof Error ? error.message : '无法创建新工作区');
+    } finally {
+      setWorkspaceCreating(false);
+    }
+  }
+
+  async function deleteWorkspace() {
+    if (!workspaceDeleteTarget || workspaceDeleting) return;
+
+    const deletedWorkspace = workspaceDeleteTarget.path;
+    setWorkspaceDeleting(true);
+    setWorkspaceDeleteError('');
+    setWorkspacePickerError('');
+    try {
+      const response = await fetch(`${API_BASE}/api/workspaces?path=${encodeURIComponent(deletedWorkspace)}`, { method: 'DELETE' });
+      const data = await response.json() as { detail?: string; trash_location?: string };
+      if (!response.ok) throw new Error(data.detail || '无法删除该工作区');
+
+      const rootResponse = await fetch(`${API_BASE}/api/workspaces?path=.`);
+      const rootData = await rootResponse.json() as WorkspaceListing & { detail?: string };
+      if (!rootResponse.ok) throw new Error(rootData.detail || '工作区已删除，但列表刷新失败');
+
+      setWorkspaceDeleteTarget(undefined);
+      setWorkspaceDeleteError('');
+      setWorkspaceListing(rootData);
+      setWorkspaceRootDirectories(rootData.directories);
+      setWorkspaceDraft('.');
+
+      if (workspacePathsOverlap(workspace, deletedWorkspace)) {
+        const nextWorkspace = PROJECT_WORKSPACES.find(
+          (project) => rootData.directories.some((directory) => directory.path === project.path),
+        )?.path ?? rootData.directories[0]?.path ?? '.';
+        clearCurrentRunForWorkspace(nextWorkspace);
+      }
+      setNotice(`工作区 ${deletedWorkspace} 已移到本地回收区，需要时可以恢复。`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '无法删除该工作区';
+      setWorkspaceDeleteError(message);
+      setWorkspacePickerError(message);
+    } finally {
+      setWorkspaceDeleting(false);
+    }
   }
 
   async function confirmNewWorkspace() {
@@ -939,25 +1442,23 @@ export default function Home() {
       const selectedName = PROJECT_WORKSPACES.find((item) => item.path === data.current)?.name
         ?? (data.current === '.' ? '工作区根目录' : data.current.split('/').filter(Boolean).at(-1) ?? data.current);
 
-      streamRef.current?.close();
-      sessionStorage.removeItem(RUN_SESSION_KEY);
-      setWorkspace(data.current);
-      setTask('');
-      setSubmittedTask('');
-      setRunId(undefined);
-      setRunStatus('idle');
-      setEvents([]);
-      setPlan(IDLE_PLAN);
-      setSelectedId(undefined);
-      setNotice(
-        previousTaskContinues
-          ? `原任务会继续在后台运行，已为新任务选择 ${selectedName} 工作区。`
-          : `已选择 ${selectedName} 工作区，请输入新任务需求。`,
-      );
-      setInteractionFeedback('');
-      setShowInteractionFeedback(false);
-      setSkillChoice('');
       setWorkspacePickerOpen(false);
+      const latest = taskRuns.find((run) => run.workspace === data.current);
+      if (latest) {
+        await openTask(latest);
+        setNotice(
+          previousTaskContinues
+            ? `原任务会继续在后台运行，已恢复 ${selectedName} 工作区最近的对话。`
+            : `已恢复 ${selectedName} 工作区最近的对话，可以继续补充要求。`,
+        );
+      } else {
+        clearCurrentRunForWorkspace(data.current);
+        setNotice(
+          previousTaskContinues
+            ? `原任务会继续在后台运行，已为新任务选择 ${selectedName} 工作区。`
+            : `已选择 ${selectedName} 工作区，请输入新任务需求。`,
+        );
+      }
       window.setTimeout(() => composerRef.current?.focus(), 0);
     } catch (error) {
       setWorkspacePickerError(error instanceof Error ? error.message : '无法选择该工作区');
@@ -981,18 +1482,28 @@ export default function Home() {
     setInteractionFeedback('');
     setShowInteractionFeedback(false);
     setSkillChoice('');
+    setConversationTurns([]);
+    setSessionId('');
+    setSessionTree(undefined);
+    setBranchTarget(undefined);
     setPetOpen(false);
   }
 
   function selectWorkspace(nextWorkspace: string) {
-    if (nextWorkspace === workspace && !submittedTask) return;
+    if (nextWorkspace === workspace && submittedTask) return;
+    const latest = taskRuns.find((run) => run.workspace === nextWorkspace);
+    if (latest) {
+      void openTask(latest);
+      return;
+    }
     clearCurrentRunForWorkspace(nextWorkspace);
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
-      void startRun();
+      if (runStatus === 'running') void sendSteering();
+      else void startRun();
     }
   }
 
@@ -1002,7 +1513,7 @@ export default function Home() {
         <div className="sidebar-top">
           <div className="brand-lockup">
             <span className="brand-glyph" aria-hidden="true">›_</span>
-            <strong>TraceCoder</strong>
+            <strong>IntentFlow</strong>
           </div>
           <button className="new-run-button" type="button" onClick={newRun}>
             <span aria-hidden="true">＋</span> 新建任务
@@ -1011,56 +1522,71 @@ export default function Home() {
 
         <nav className="sidebar-nav" aria-label="任务导航">
           <p>工作区</p>
-          {PROJECT_WORKSPACES.map((project) => (
-            <button
-              className={`nav-item ${workspace === project.path ? 'active' : ''}`}
-              type="button"
-              key={project.path}
-              onClick={() => selectWorkspace(project.path)}
-              aria-pressed={workspace === project.path}
-            >
-              <span className="nav-icon">{project.icon}</span>
-              <span><strong>{project.name}</strong><small>{project.stack}</small></span>
-            </button>
-          ))}
+          {sidebarProjectWorkspaces.map((project) => {
+            const busy = workspaceIsBusy(project.path);
+            return (
+              <div className="nav-workspace-row" key={project.path}>
+                <button
+                  className={`nav-item ${workspace === project.path ? 'active' : ''}`}
+                  type="button"
+                  onClick={() => selectWorkspace(project.path)}
+                  aria-pressed={workspace === project.path}
+                >
+                  <span className="nav-icon">{project.icon}</span>
+                  <span><strong>{project.name}</strong><small>{project.stack}</small></span>
+                </button>
+                <button
+                  className="nav-workspace-delete"
+                  type="button"
+                  onClick={() => { setWorkspaceDeleteError(''); setWorkspaceDeleteTarget({ name: project.name, path: project.path }); }}
+                  disabled={busy}
+                  aria-label={`删除工作区 ${project.name}`}
+                  title={busy ? '任务运行中，暂时不能删除' : `删除 ${project.name}`}
+                >删除</button>
+              </div>
+            );
+          })}
           {!knownActiveWorkspace && (
-            <button className="nav-item active" type="button" aria-pressed="true">
-              <span className="nav-icon">⌁</span>
-              <span><strong>{activeWorkspace.name}</strong><small>{workspace}</small></span>
-            </button>
+            <div className="nav-workspace-row">
+              <button className="nav-item active" type="button" aria-pressed="true">
+                <span className="nav-icon">⌁</span>
+                <span><strong>{activeWorkspace.name}</strong><small>{workspace}</small></span>
+              </button>
+              {workspace !== '.' && workspace.split('/').filter(Boolean).length === 1 && (
+                <button
+                  className="nav-workspace-delete"
+                  type="button"
+                  onClick={() => { setWorkspaceDeleteError(''); setWorkspaceDeleteTarget({ name: activeWorkspace.name, path: workspace }); }}
+                  disabled={workspaceIsBusy(workspace)}
+                  aria-label={`删除工作区 ${activeWorkspace.name}`}
+                  title={workspaceIsBusy(workspace) ? '任务运行中，暂时不能删除' : `删除 ${activeWorkspace.name}`}
+                >删除</button>
+              )}
+            </div>
           )}
 
           <p className="sidebar-section-label">Agent 设置</p>
-          <Link className="nav-item" href="/skills">
+          <a className="nav-item" href="/skills">
             <span className="nav-icon">S</span>
             <span>
               <strong>Skill 管理</strong>
               <small>添加、启用或停用能力</small>
             </span>
-          </Link>
-          <Link className="nav-item" href="/settings">
+          </a>
+          <a className="nav-item" href="/settings">
             <span className="nav-icon">⚙</span>
             <span>
               <strong>Agent 设置</strong>
               <small>模式、工作流与执行预算</small>
             </span>
-          </Link>
-
-          <p className="sidebar-section-label">演示控制</p>
-          <button className="nav-item" type="button" onClick={resetDemo} disabled={isActiveStatus(runStatus) || !knownActiveWorkspace}>
-            <span className="nav-icon">↻</span>
-            <span>
-              <strong>重置演示项目</strong>
-              <small>{knownActiveWorkspace ? `恢复 ${activeWorkspace.name} 的初始故障` : '仅预置演示工作区可重置'}</small>
-            </span>
-          </button>
+          </a>
 
         </nav>
 
         <div className="pet-companion">
-          <button type="button" className={`pet-companion-button ${petMood}`} onClick={() => setPetOpen((open) => !open)} aria-expanded={petOpen} aria-controls="tracepet-task-center">
+          <button type="button" className={`pet-companion-button ${petMood}`} onClick={() => setPetOpen((open) => !open)} aria-expanded={petOpen} aria-controls="flowpet-task-center">
             <span className="pet-avatar" aria-hidden="true">ʕ•ᴥ•ʔ<i /></span>
-            <span className="pet-companion-copy"><strong>TracePet</strong><small>{petMessage}</small></span>
+            <span className="pet-companion-copy"><strong>FlowPet</strong><small>{petMessage}</small></span>
             <span className="pet-task-count">{activeTaskCount}</span>
           </button>
         </div>
@@ -1084,18 +1610,18 @@ export default function Home() {
 
       {workspacePickerOpen && (
         <>
-          <button className="workspace-picker-backdrop" type="button" onClick={() => setWorkspacePickerOpen(false)} aria-label="关闭工作区选择器" />
+          <button className="workspace-picker-backdrop" type="button" onClick={() => { setWorkspacePickerOpen(false); setWorkspaceDeleteTarget(undefined); setWorkspaceCreateOpen(false); }} aria-label="关闭工作区选择器" />
           <section className="workspace-picker" role="dialog" aria-modal="true" aria-labelledby="workspace-picker-title">
             <header>
               <div><span aria-hidden="true">⌁</span><div><small>NEW TASK</small><h2 id="workspace-picker-title">选择本地工作区</h2></div></div>
-              <button type="button" onClick={() => setWorkspacePickerOpen(false)} aria-label="关闭">×</button>
+              <button type="button" onClick={() => { setWorkspacePickerOpen(false); setWorkspaceDeleteTarget(undefined); setWorkspaceCreateOpen(false); }} aria-label="关闭">×</button>
             </header>
 
             <div className="workspace-picker-body">
               <aside>
                 <small>预置工作区</small>
                 <div className="workspace-preset-list">
-                  {PROJECT_WORKSPACES.map((project) => {
+                  {availableProjectWorkspaces.map((project) => {
                     const busy = workspaceIsBusy(project.path);
                     return (
                       <button
@@ -1119,24 +1645,41 @@ export default function Home() {
                 <div className="workspace-root-line"><span>本地根目录</span><code>{workspaceListing?.root_path ?? '正在连接…'}</code></div>
                 <form className="workspace-path-form" onSubmit={(event) => { event.preventDefault(); void loadWorkspaceDirectory(workspaceDraft); }}>
                   <label htmlFor="workspace-path">工作区路径</label>
-                  <div><input id="workspace-path" value={workspaceDraft} onChange={(event) => setWorkspaceDraft(event.target.value)} placeholder="例如 examples/my-project" autoComplete="off" /><button type="submit" disabled={workspacePickerLoading}>定位</button></div>
+                  <div><input id="workspace-path" value={workspaceDraft} onChange={(event) => setWorkspaceDraft(event.target.value)} placeholder="例如 my-project" autoComplete="off" /><button type="submit" disabled={workspacePickerLoading}>定位</button></div>
                 </form>
 
                 {workspacePickerError && <div className="workspace-picker-error" role="alert"><span>!</span>{workspacePickerError}</div>}
 
-                <div className="workspace-directory-head"><strong>文件夹</strong><small>{workspaceListing?.current ?? '.'}</small></div>
+                <div className="workspace-directory-head">
+                  <div><strong>{workspaceListing?.current === '.' ? '项目工作区 · 可管理' : '子文件夹'}</strong><small>{workspaceListing?.current ?? '.'}</small></div>
+                  <button type="button" onClick={() => { setWorkspaceNewName(''); setWorkspaceCreateError(''); setWorkspaceCreateOpen(true); }} disabled={workspacePickerLoading}>
+                    <span>＋</span> 新建项目工作区
+                  </button>
+                </div>
                 <div className="workspace-directory-list" aria-busy={workspacePickerLoading}>
                   {workspaceListing?.parent !== null && workspaceListing && (
-                    <button type="button" onClick={() => void loadWorkspaceDirectory(workspaceListing.parent ?? '.')} disabled={workspacePickerLoading}>
+                    <button className="workspace-directory-open standalone" type="button" onClick={() => void loadWorkspaceDirectory(workspaceListing.parent ?? '.')} disabled={workspacePickerLoading}>
                       <span className="folder-icon">↰</span><span><strong>返回上一级</strong><small>{workspaceListing.parent ?? '.'}</small></span>
                     </button>
                   )}
                   {workspaceListing?.directories.map((directory) => {
                     const busy = workspaceIsBusy(directory.path);
                     return (
-                      <button type="button" onClick={() => void loadWorkspaceDirectory(directory.path)} disabled={workspacePickerLoading} key={directory.path}>
-                        <span className="folder-icon">▰</span><span><strong>{directory.name}</strong><small>{directory.path}</small></span>{busy && <em>任务运行中</em>}
-                      </button>
+                      <div className="workspace-directory-row" key={directory.path}>
+                        <button className="workspace-directory-open" type="button" onClick={() => void loadWorkspaceDirectory(directory.path)} disabled={workspacePickerLoading}>
+                          <span className="folder-icon">▰</span><span><strong>{directory.name}</strong><small>{directory.path}</small></span>{busy && <em>任务运行中</em>}
+                        </button>
+                        {workspaceListing.current === '.' && (
+                          <button
+                            className="workspace-directory-delete"
+                            type="button"
+                            onClick={() => { setWorkspaceDeleteError(''); setWorkspaceDeleteTarget(directory); }}
+                            disabled={workspacePickerLoading || busy}
+                            aria-label={`删除工作区 ${directory.name}`}
+                            title={busy ? '任务运行中，暂时不能删除' : `删除 ${directory.name}`}
+                          >删除</button>
+                        )}
+                      </div>
                     );
                   })}
                   {!workspacePickerLoading && workspaceListing?.directories.length === 0 && <div className="workspace-directory-empty">这个文件夹中没有可继续浏览的子目录</div>}
@@ -1147,7 +1690,7 @@ export default function Home() {
 
             <footer>
               <div><small>当前选择</small><code>{workspaceDraft || '.'}</code></div>
-              <button type="button" onClick={() => setWorkspacePickerOpen(false)}>取消</button>
+              <button type="button" onClick={() => { setWorkspacePickerOpen(false); setWorkspaceDeleteTarget(undefined); setWorkspaceCreateOpen(false); }}>取消</button>
               <button type="button" className="confirm-workspace" onClick={() => void confirmNewWorkspace()} disabled={workspacePickerLoading || workspaceIsBusy(workspaceDraft.trim() || '.')}>
                 选择此工作区
               </button>
@@ -1156,16 +1699,72 @@ export default function Home() {
         </>
       )}
 
-      <button type="button" className={`pet-mobile-launch ${petMood}`} onClick={() => setPetOpen(true)} aria-label={`打开 TracePet，${petMessage}`}>
+      {workspaceCreateOpen && (
+        <>
+          <button className="workspace-create-backdrop" type="button" onClick={() => { if (!workspaceCreating) { setWorkspaceCreateOpen(false); setWorkspaceCreateError(''); } }} aria-label="取消新建工作区" />
+          <section className="workspace-create-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-create-title" aria-describedby="workspace-create-description">
+            <header>
+              <span aria-hidden="true">＋</span>
+              <div><small>NEW PROJECT WORKSPACE</small><h2 id="workspace-create-title">新建项目工作区</h2></div>
+            </header>
+            <form onSubmit={createNewWorkspace}>
+              <p id="workspace-create-description">创建一个只属于新项目的空文件夹。创建后会立即选中它，你可以直接向 Agent 描述要实现的项目。</p>
+              <label htmlFor="workspace-new-name">文件夹名称</label>
+              <input
+                id="workspace-new-name"
+                value={workspaceNewName}
+                onChange={(event) => { setWorkspaceNewName(event.target.value); setWorkspaceCreateError(''); }}
+                placeholder="例如 pomodoro-app"
+                maxLength={80}
+                autoComplete="off"
+                autoFocus
+                disabled={workspaceCreating}
+              />
+              <div className="workspace-create-location"><span>创建位置</span><code>{workspaceListing?.root_path ?? 'workspaces'}/{workspaceNewName.trim() || '新项目'}</code></div>
+              {workspaceCreateError && <p className="workspace-create-error" role="alert">{workspaceCreateError}</p>}
+              <footer>
+                <button type="button" onClick={() => { setWorkspaceCreateOpen(false); setWorkspaceCreateError(''); }} disabled={workspaceCreating}>取消</button>
+                <button className="confirm-create-workspace" type="submit" disabled={workspaceCreating || !workspaceNewName.trim()}>
+                  {workspaceCreating ? '正在创建…' : '创建并开始项目'}
+                </button>
+              </footer>
+            </form>
+          </section>
+        </>
+      )}
+
+      {workspaceDeleteTarget && (
+        <>
+          <button className="workspace-delete-backdrop" type="button" onClick={() => { if (!workspaceDeleting) { setWorkspaceDeleteTarget(undefined); setWorkspaceDeleteError(''); } }} aria-label="取消删除工作区" />
+          <section className="workspace-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="workspace-delete-title" aria-describedby="workspace-delete-description">
+            <span className="workspace-delete-icon" aria-hidden="true">!</span>
+            <div>
+              <small>DELETE WORKSPACE</small>
+              <h2 id="workspace-delete-title">移除“{workspaceDeleteTarget.name}”工作区？</h2>
+              <p id="workspace-delete-description">项目将从工作区列表中移除，并完整转移到本地回收区，不会立即永久删除。</p>
+              <code>{workspaceDeleteTarget.path}</code>
+              {workspaceDeleteError && <p className="workspace-delete-error" role="alert">{workspaceDeleteError}</p>}
+            </div>
+            <footer>
+              <button type="button" onClick={() => { setWorkspaceDeleteTarget(undefined); setWorkspaceDeleteError(''); }} disabled={workspaceDeleting}>取消</button>
+              <button className="confirm-delete-workspace" type="button" onClick={() => void deleteWorkspace()} disabled={workspaceDeleting}>
+                {workspaceDeleting ? '正在移动…' : '移到回收区'}
+              </button>
+            </footer>
+          </section>
+        </>
+      )}
+
+      <button type="button" className={`pet-mobile-launch ${petMood}`} onClick={() => setPetOpen(true)} aria-label={`打开 FlowPet，${petMessage}`}>
         <span aria-hidden="true">ʕ•ᴥ•ʔ</span><i>{activeTaskCount}</i>
       </button>
 
       {petOpen && (
         <>
           <button className="pet-panel-backdrop" type="button" onClick={() => setPetOpen(false)} aria-label="关闭任务中心" />
-          <aside className="pet-task-center" id="tracepet-task-center" role="dialog" aria-modal="false" aria-labelledby="tracepet-title">
+          <aside className="pet-task-center" id="flowpet-task-center" role="dialog" aria-modal="false" aria-labelledby="flowpet-title">
             <header>
-              <div><span className={`pet-panel-avatar ${petMood}`} aria-hidden="true">ʕ•ᴥ•ʔ</span><div><small>YOUR TASK COMPANION</small><h2 id="tracepet-title">TracePet 任务中心</h2></div></div>
+              <div><span className={`pet-panel-avatar ${petMood}`} aria-hidden="true">ʕ•ᴥ•ʔ</span><div><small>YOUR TASK COMPANION</small><h2 id="flowpet-title">FlowPet 任务中心</h2></div></div>
               <button type="button" onClick={() => setPetOpen(false)} aria-label="关闭">×</button>
             </header>
             <div className="pet-overview">
@@ -1199,7 +1798,7 @@ export default function Home() {
       {petReminder && (
         <div className="pet-reminder" role="status">
           <span aria-hidden="true">ʕ•ᴥ•ʔ</span>
-          <div><strong>TracePet 提醒</strong><p>{petReminder}</p></div>
+          <div><strong>FlowPet 提醒</strong><p>{petReminder}</p></div>
           <button type="button" onClick={() => { setPetOpen(true); setPetReminder(''); }}>查看</button>
           <button type="button" onClick={() => setPetReminder('')} aria-label="关闭提醒">×</button>
         </div>
@@ -1222,6 +1821,34 @@ export default function Home() {
         <div className="conversation-scroll" ref={conversationRef}>
           {submittedTask && (
             <div className="chat-thread">
+              {conversationTurns.map((turn) => {
+                const treeEntry = sessionTree?.entries.find((entry) => entry.run_id === turn.run_id);
+                return (
+                <div className="conversation-history-turn" key={turn.run_id}>
+                  <section className="message user-message">
+                    <div className="message-avatar user-avatar">你</div>
+                    <div className="message-body">
+                      <div className="message-meta"><strong>你</strong><time>{formatTime(turn.created_at)}</time></div>
+                      <p>{turn.task}</p>
+                    </div>
+                  </section>
+                  <section className="message agent-message history-agent-message">
+                    <div className="message-avatar agent-avatar">›_</div>
+                    <div className="message-body">
+                      <div className="message-meta"><strong>IntentFlow</strong><span className="agent-badge">HISTORY</span></div>
+                      <p>{turn.summary || (turn.status === 'completed' ? '该轮任务已完成。' : '该轮任务未完成，可以继续处理。')}</p>
+                    </div>
+                  </section>
+                  {treeEntry && ['completed', 'failed', 'cancelled'].includes(treeEntry.status) && (
+                    <div className="history-branch-row">
+                      <button type="button" onClick={() => { setBranchTarget(treeEntry); composerRef.current?.focus(); }}>
+                        ↳ 从这里创建分支
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );})}
+
               <section className="message user-message">
                 <div className="message-avatar user-avatar">你</div>
                 <div className="message-body">
@@ -1233,14 +1860,45 @@ export default function Home() {
               <section className="message agent-message">
                 <div className="message-avatar agent-avatar">›_</div>
                 <div className="message-body">
-                  <div className="message-meta"><strong>TraceCoder</strong><span className="agent-badge">AGENT</span></div>
+                  <div className="message-meta"><strong>IntentFlow</strong><span className="agent-badge">AGENT</span></div>
                   <p className="agent-intro">
-                    {selectedSkill
-                      ? interactionFirst
-                        ? `已加载 ${selectedSkill.title}。我会先输出终端用户交互流程，得到你的确认后再开始实现。`
-                        : `已加载 ${selectedSkill.title}。我会先理解项目并复现问题，然后实施最小修改并运行验证。`
-                      : '正在分析任务并选择合适的 Skill…'}
+                    {interactionFirst && !selectedSkill
+                      ? '独立需求分析器判断本任务需要先确认终端用户流程；确认后再自动组合合适的 Skill。'
+                      : selectedSkill
+                        ? `已组合 ${selectedSkill.title}。我会综合这些策略理解项目、实施修改并运行验证。`
+                        : '正在分析任务并组合合适的 Skill…'}
                   </p>
+
+                  {communicationEvents.length > 0 && (
+                    <section className="communication-log" aria-label="用户补充与方向修正记录">
+                      <div className="communication-log-head">
+                        <strong>沟通记录</strong>
+                        <small>{communicationEvents.length} 条</small>
+                      </div>
+                      <div className="communication-log-list">
+                        {communicationEvents.map((event) => {
+                          const message = typeof event.payload?.message === 'string'
+                            ? event.payload.message
+                            : typeof event.payload?.feedback === 'string'
+                              ? event.payload.feedback
+                              : event.summary;
+                          const steeringId = String(event.payload?.steering_id ?? '');
+                          const applied = event.type === 'steering_received' && steeringAppliedIds.has(steeringId);
+                          const isRequirement = event.type === 'user_requirement_received' || event.type === 'interaction_confirmation_resolved';
+                          return (
+                            <div className={`communication-item ${isRequirement ? 'requirement' : 'steering'}`} key={event.event_id}>
+                              <span className="communication-icon">{isRequirement ? '✦' : '↗'}</span>
+                              <div className="communication-copy">
+                                <div><strong>{isRequirement ? '补充需求' : 'Steering 方向修正'}</strong><time>{formatTime(event.timestamp)}</time></div>
+                                <p>{message}</p>
+                              </div>
+                              <em>{isRequirement ? '已用于更新流程' : applied ? '已生效' : '等待处理'}</em>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  )}
 
                   {chatEvents.length > 0 && (
                     <div className="inline-activity">
@@ -1278,23 +1936,41 @@ export default function Home() {
                           markerId="page-flow-arrow"
                           label={`${interactionModel.title} 页面流转图`}
                         />
-                        <div className="flowchart-legend"><span><i className="node-sample" />页面或弹层</span><span><i className="edge-sample" />用户操作与流转方向</span></div>
+                        <div className="flowchart-legend"><span><i className="node-sample" />页面或弹层</span><span><i className="edge-sample" />主流程方向</span><span><i className="feedback-sample" />反馈回路（可展开）</span></div>
+                        <div className="flow-detail-head"><strong>路径说明</strong><small>编号与图中一致，完整保留用户操作</small></div>
+                        <ol className={`flow-edge-list ${(interactionModel.flows?.length ?? 0) > 6 ? 'complex-flow-list' : ''}`}>
+                          {(interactionModel.flows ?? []).map((flow, index) => {
+                            const source = interactionModel.pages?.find((page) => page.id === flow.from)?.name ?? flow.from;
+                            const target = interactionModel.pages?.find((page) => page.id === flow.to)?.name ?? flow.to;
+                            return (
+                              <li key={`${flow.from}-${flow.to}-${index}`}>
+                                <span>{index + 1}</span>
+                                <strong>{source}</strong>
+                                <em>{flow.action}</em>
+                                <b aria-hidden="true">→</b>
+                                <strong>{target}</strong>
+                              </li>
+                            );
+                          })}
+                        </ol>
                       </div>
 
                       <div className="interaction-columns">
-                        <div className="interaction-section state-section">
-                          <div className="interaction-section-title"><strong>核心状态机</strong><small>{interactionStateNodes.length} 个状态</small></div>
-                          <NodeFlowDiagram
-                            nodes={interactionStateNodes}
-                            edges={interactionStateEdges}
-                            markerId="state-flow-arrow"
-                            label={`${interactionModel.title} 状态机图`}
-                          />
-                        </div>
                         <div className="interaction-section criteria-section">
                           <div className="interaction-section-title"><strong>验收标准</strong><small>{interactionModel.acceptance_criteria?.length ?? 0} 项</small></div>
                           <ul className="criteria-list">
-                            {(interactionModel.acceptance_criteria ?? []).map((criterion, index) => <li key={`${criterion}-${index}`}><span>✓</span>{criterion}</li>)}
+                            {(interactionModel.acceptance_criteria ?? []).map((criterion, index) => {
+                              const criterionId = typeof criterion === 'string'
+                                ? `AC-${String(index + 1).padStart(2, '0')}`
+                                : criterion.id;
+                              const description = typeof criterion === 'string' ? criterion : criterion.description;
+                              return (
+                                <li key={criterionId}>
+                                  <span>{criterionId}</span>
+                                  {description}
+                                </li>
+                              );
+                            })}
                           </ul>
                         </div>
                       </div>
@@ -1347,6 +2023,7 @@ export default function Home() {
                         <p>{finalEvent.summary}</p>
                         <div className="result-chips">
                           {changedFiles.map((file) => <span key={file}>± {file}</span>)}
+                          {traceability?.active && <span>AC {traceability.verified}/{traceability.total}</span>}
                           {runStatus === 'completed' && <span>✓ 验证通过</span>}
                         </div>
                       </div>
@@ -1453,32 +2130,50 @@ export default function Home() {
             </section>
           ) : (
             <div className="composer-card">
+              {branchTarget && (
+                <div className="branch-composer-banner">
+                  <span>↳</span>
+                  <p>将从“{branchTarget.task.slice(0, 36)}”创建新分支</p>
+                  <button type="button" onClick={() => setBranchTarget(undefined)} aria-label="取消分支">×</button>
+                </div>
+              )}
               <textarea
                 ref={composerRef}
                 value={task}
                 onChange={(event) => setTask(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
                 rows={3}
-                aria-label="给 TraceCoder 的任务"
-                placeholder={`描述要在 ${activeWorkspace.name} 工作区完成的任务…`}
+                aria-label="给 IntentFlow 的任务"
+                placeholder={runStatus === 'running'
+                  ? '输入运行中的方向修正，例如：不要修改后端，优先完善移动端交互…'
+                  : `描述要在 ${activeWorkspace.name} 工作区完成的任务…`}
               />
               <div className="composer-toolbar">
                 <div className="path-pill" title={workspace}>
                   <span>⌁</span>
                   <code>{workspace}</code>
                 </div>
-                <label className="composer-skill-picker" title="选择自动路由或手动指定 Skill">
-                  <span>S</span>
-                  <select value={requestedSkill} onChange={(event) => setRequestedSkill(event.target.value)} aria-label="任务 Skill">
-                    <option value="auto">自动选择 Skill</option>
-                    {skillOptions.map((skill) => (
-                      <option value={skill.name} key={skill.name}>{skill.display_name}</option>
-                    ))}
-                  </select>
-                </label>
-                <span className="keyboard-hint">Enter 发送 · Shift + Enter 换行</span>
+                {runStatus === 'running' ? (
+                  <span className="steering-mode-pill" title="消息会在下一次模型决策前生效">↗ Steering</span>
+                ) : (
+                  <label className="composer-skill-picker" title="自动组合最多三项互补 Skill，或手动锁定一项">
+                    <span>S</span>
+                    <select value={requestedSkill} onChange={(event) => setRequestedSkill(event.target.value)} aria-label="任务 Skill">
+                      <option value="auto">自动组合 Skill（最多 3 项）</option>
+                      {skillOptions.map((skill) => (
+                        <option value={skill.name} key={skill.name}>{skill.display_name}</option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                <span className="keyboard-hint">{runStatus === 'running' ? 'Enter 修正方向 · Shift + Enter 换行' : 'Enter 发送 · Shift + Enter 换行'}</span>
                 {isActiveStatus(runStatus) ? (
-                  <button className="stop-button" type="button" onClick={cancelRun} aria-label="停止任务">■</button>
+                  <>
+                    <button className="steering-send-button" type="button" onClick={() => void sendSteering()} disabled={!task.trim() || steeringSubmitting || runStatus !== 'running'} aria-label="发送方向修正">
+                      {steeringSubmitting ? '…' : '↗'}
+                    </button>
+                    <button className="stop-button" type="button" onClick={cancelRun} aria-label="停止任务">■</button>
+                  </>
                 ) : (
                   <button className="send-button" type="button" onClick={startRun} disabled={!task.trim()} aria-label="开始运行">↑</button>
                 )}
@@ -1492,7 +2187,9 @@ export default function Home() {
               ? '请先确认产品交互；未确认前 Agent 不会开始编写代码。'
               : runStatus === 'waiting_approval'
                 ? '请审查上方操作；按 Enter 同意，按 Esc 拒绝。'
-                : 'TraceCoder 会在本地受控工作区中读写文件并执行命令，请审查重要改动。'}
+                : runStatus === 'running'
+                  ? '可以随时补充方向；消息会在下一次模型决策前生效，不会跳过授权和质量检查。'
+                : 'IntentFlow 会在本地受控工作区中读写文件并执行命令，请审查重要改动。'}
           </p>
         </div>
       </section>
@@ -1517,6 +2214,40 @@ export default function Home() {
             </div>
           </section>
 
+          {traceability?.active && (
+            <section className="inspector-section traceability-section">
+              <div className="section-title"><span>需求证据</span><small>{traceability.verified}/{traceability.total}</small></div>
+              <div className="traceability-progress">
+                <span style={{ width: `${traceability.coverage_percent}%` }} />
+              </div>
+              <div className="traceability-summary">
+                <strong>{traceability.coverage_percent}%</strong>
+                <span>确认需求已形成实现与验证证据</span>
+              </div>
+              <div className="requirement-ledger">
+                {traceability.requirements.map((requirement) => (
+                  <details className={requirement.status} key={requirement.requirement_id}>
+                    <summary>
+                      <span>{requirement.status === 'verified' ? '✓' : requirement.status === 'failed' ? '!' : requirement.status === 'implemented' ? '◐' : '○'}</span>
+                      <p><strong>{requirement.requirement_id}</strong>{requirement.description}</p>
+                      <em>{requirement.status === 'verified' ? '已验证' : requirement.status === 'implemented' ? '待验证' : requirement.status === 'failed' ? '验证失败' : '待实现'}</em>
+                    </summary>
+                    <div className="requirement-evidence-list">
+                      {requirement.evidence.length === 0 ? (
+                        <p>还没有关联证据。</p>
+                      ) : requirement.evidence.slice(-5).map((evidence) => (
+                        <div className={evidence.passed ? 'passed' : 'failed'} key={evidence.evidence_id}>
+                          <span>{evidence.evidence_type === 'implementation' ? '实现' : evidence.evidence_type === 'verification' ? '验证' : '审查'}</span>
+                          <p><strong>{evidence.artifact || evidence.command || evidence.tool}</strong><small>{evidence.summary}</small></p>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                ))}
+              </div>
+            </section>
+          )}
+
           <section className="inspector-section phase-strip-section">
             <div className="section-title"><span>阶段</span><small>{Math.max(0, currentPhaseIndex + 1)}/{visiblePhases.length}</small></div>
             <div className="phase-strip" style={{ gridTemplateColumns: `repeat(${visiblePhases.length}, minmax(0, 1fr))` }}>
@@ -1532,7 +2263,26 @@ export default function Home() {
           {selectedSkill && (
             <section className="skill-banner">
               <span className="skill-symbol">S</span>
-              <div><small>ACTIVE SKILL</small><strong>{selectedSkill.title}</strong><p>{selectedSkill.summary}</p></div>
+              <div><small>ACTIVE SKILLS</small><strong>{selectedSkill.title}</strong><p>{selectedSkill.summary}</p></div>
+            </section>
+          )}
+
+          {sessionTree && sessionTree.entries.length > 0 && (
+            <section className="inspector-section session-tree-section">
+              <div className="section-title"><span>Session 分支</span><small>{sessionTree.entries.length} 个节点</small></div>
+              <div className="session-tree-list">
+                {sessionTree.entries.map((entry) => (
+                  <div className={`${entry.active ? 'active' : ''} ${entry.status}`} style={{ paddingLeft: `${entry.depth * 14}px` }} key={entry.entry_id}>
+                    <button type="button" className="session-node-main" onClick={() => void openTask({ run_id: entry.run_id })} title={entry.task}>
+                      <span>{entry.child_count ? '◆' : '◇'}</span>
+                      <p><strong>{entry.task}</strong><small>{taskStatusLabel(entry.status)}</small></p>
+                    </button>
+                    {['completed', 'failed', 'cancelled'].includes(entry.status) && (
+                      <button type="button" className="session-node-branch" onClick={() => { setBranchTarget(entry); composerRef.current?.focus(); }} title="从此节点创建新分支">↳</button>
+                    )}
+                  </div>
+                ))}
+              </div>
             </section>
           )}
 
@@ -1566,6 +2316,17 @@ export default function Home() {
               <span className={`selected-event-icon ${activeEvent?.status ?? 'pending'}`}>{eventIcon(activeEvent)}</span>
               <div><strong>{activeEvent?.title ?? '暂无执行记录'}</strong><small>{activeEvent?.summary ?? '选择一条活动查看完整信息。'}</small></div>
             </div>
+            {tab === 'detail' && activeHookPipeline && (
+              <div className="hook-pipeline-strip" aria-label="本次工具调用 Hook 管线">
+                <span>BEFORE</span>
+                <strong>{hookLabel(String(activeHookPipeline.before?.hook ?? 'hook_pipeline'))}</strong>
+                <i>→</i>
+                <span>TOOL</span>
+                <i>→</i>
+                <span>AFTER</span>
+                <strong>{(activeHookPipeline.after ?? []).map(hookLabel).join(' · ') || '无后置处理'}</strong>
+              </div>
+            )}
             <pre className={`code-view ${tab}`}>{tabContent}</pre>
           </section>
         </div>

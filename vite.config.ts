@@ -51,7 +51,7 @@ export default defineConfig(async () => {
         // Agent workspaces and audit logs are runtime data, not console source.
         // Watching them would reload the React page whenever the Agent creates
         // an index.html, which discards the in-memory run view mid-task.
-        ignored: ['**/examples/**', '**/.tracecoder/**'],
+        ignored: ['**/examples/**', '**/.intentflow/**', '**/.tracecoder/**'],
         ...(isCodexSeatbeltSandbox ? { useFsEvents: false, usePolling: true } : {}),
       },
     },

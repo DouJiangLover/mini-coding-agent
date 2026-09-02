@@ -1,6 +1,5 @@
 'use client';
 
-import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
 
 type AgentMode = 'safe' | 'standard' | 'autonomous' | 'read_only';
@@ -52,7 +51,7 @@ const MODE_OPTIONS: { id: AgentMode; title: string; eyebrow: string; description
 
 const DEFAULT_SETTINGS: AgentSettings = {
   mode: 'standard',
-  max_steps: 30,
+  max_steps: 45,
   failure_limit: 3,
   interaction_first: true,
   require_verification: true,
@@ -178,16 +177,16 @@ export default function AgentSettingsPage() {
   return (
     <main className="skill-manager-shell settings-page-shell">
       <header className="skill-manager-topbar">
-        <Link className="skill-brand" href="/" aria-label="返回 TraceCoder 工作台"><span>›_</span><strong>TraceCoder</strong></Link>
+        <a className="skill-brand" href="/" aria-label="返回 IntentFlow 工作台"><span>›_</span><strong>IntentFlow</strong></a>
         <div className="manager-topbar-links">
-          <Link className="back-to-workspace" href="/skills"><span>S</span> Skill 管理</Link>
-          <Link className="back-to-workspace" href="/"><span>←</span> 返回工作台</Link>
+          <a className="back-to-workspace" href="/skills"><span>S</span> Skill 管理</a>
+          <a className="back-to-workspace" href="/"><span>←</span> 返回工作台</a>
         </div>
       </header>
 
       <div className="settings-page-content">
         <section className="settings-heading">
-          <div><span className="page-kicker">AGENT CONFIGURATION</span><h1>Agent 设置</h1><p>控制 TraceCoder 如何规划、行动、验证和停止。每个任务启动时会锁定一份配置快照，运行中的任务不会被中途改变。</p></div>
+          <div><span className="page-kicker">AGENT CONFIGURATION</span><h1>Agent 设置</h1><p>控制 IntentFlow 如何规划、行动、验证和停止。每个任务启动时会锁定一份配置快照，运行中的任务不会被中途改变。</p></div>
           <div className="settings-heading-actions">
             <button className="reset-settings-button" type="button" onClick={() => void resetSettings()} disabled={saving || loading}>恢复默认</button>
             <button className="save-settings-button" type="button" onClick={() => void saveSettings()} disabled={saving || loading || !isDirty}>{saving ? '保存中…' : '保存设置'}</button>
@@ -220,7 +219,7 @@ export default function AgentSettingsPage() {
               <div className="workflow-setting-list">
                 <div>
                   <span className="setting-icon">F</span>
-                  <div><strong>Interaction-First</strong><p>新建前端产品时先生成终端用户流程图，确认后再写代码。</p></div>
+                  <div><strong>Interaction-First</strong><p>由独立需求分析器判断新建产品任务，先确认终端用户流程，再组合 Skill 并写代码。</p></div>
                   <SettingsSwitch checked={settings.interaction_first} onChange={() => update('interaction_first', !settings.interaction_first)} label="切换 Interaction-First" />
                 </div>
                 <div>
@@ -242,7 +241,7 @@ export default function AgentSettingsPage() {
                 <label className="range-setting-card">
                   <div><span>最大执行步骤</span><output>{settings.max_steps}</output></div>
                   <input type="range" min="5" max="100" step="5" value={settings.max_steps} onChange={(event) => update('max_steps', Number(event.target.value))} />
-                  <small>达到上限后安全停止并报告未完成原因。</small>
+                  <small>保存后的设置优先生效；环境变量只作为首次运行默认值。复杂 Web 项目建议 60 步。</small>
                   <div className="range-labels"><span>5</span><span>100 步</span></div>
                 </label>
                 <label className="range-setting-card">
@@ -272,11 +271,13 @@ export default function AgentSettingsPage() {
               <span className="immutable-badge">LOCKED</span>
             </aside>
 
-            <div className={`settings-save-dock ${isDirty ? 'visible' : ''}`} aria-hidden={!isDirty}>
-              <div><strong>有尚未保存的更改</strong><small>保存后从下一个新任务开始生效</small></div>
-              <button type="button" onClick={() => setSettings(savedSettings)} disabled={saving}>放弃更改</button>
-              <button type="button" onClick={() => void saveSettings()} disabled={saving}>{saving ? '保存中…' : '保存设置'}</button>
-            </div>
+            {isDirty && (
+              <div className="settings-save-dock visible">
+                <div><strong>有尚未保存的更改</strong><small>保存后从下一个新任务开始生效</small></div>
+                <button type="button" onClick={() => setSettings(savedSettings)} disabled={saving}>放弃更改</button>
+                <button type="button" onClick={() => void saveSettings()} disabled={saving}>{saving ? '保存中…' : '保存设置'}</button>
+              </div>
+            )}
           </>
         )}
       </div>

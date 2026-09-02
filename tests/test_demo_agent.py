@@ -38,12 +38,22 @@ def test_demo_agent_repairs_and_verifies_project(tmp_path: Path):
     assert record.successful_commands == ["pytest -q"]
     assert event_store.get("run_test").terminal
     run_events = event_store.get("run_test").events
+    started = next(event for event in run_events if event["type"] == "run_started")
+    assert started["payload"]["effective_max_steps"] == 10
+    assert started["payload"]["max_steps_source"] == "constructor_override"
+    assert "实际步数预算：10" in started["summary"]
     plan_events = [event for event in run_events if event["type"] == "plan_updated"]
     assert plan_events[0]["payload"]["items"][0]["status"] == "running"
     assert plan_events[-1]["payload"]["items"][-1]["status"] == "success"
     assert any(event["type"] == "quality_checkpoint" for event in run_events)
     assert any(event["phase"] == "reviewing" for event in run_events)
     assert not any(event["type"] == "error" and event["payload"].get("tool") == "run_command" for event in run_events)
+    finished_tools = [event for event in run_events if event["type"] == "tool_finished"]
+    assert all("hook_pipeline" in event["payload"] for event in finished_tools)
+    assert any(
+        event["payload"]["hook_pipeline"]["after"] == ["traceability_evidence", "run_observation"]
+        for event in finished_tools
+    )
 
 
 def test_demo_agent_repairs_star_catcher_combo(tmp_path: Path):

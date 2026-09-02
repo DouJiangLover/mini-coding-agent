@@ -56,9 +56,13 @@ class ToolRegistry:
         *,
         agent_mode: str = "standard",
         max_command_timeout: int = 60,
+        skill_library: dict[str, dict[str, str]] | None = None,
+        requirement_ids: list[str] | None = None,
     ) -> None:
         self.guard = WorkspaceGuard(workspace)
         self.allowed_tools = set(allowed_tools or self.available_names())
+        self.skill_library = skill_library or {}
+        self.requirement_ids = list(dict.fromkeys(requirement_ids or []))
         self.agent_mode = agent_mode
         self.max_command_timeout = max(1, min(int(max_command_timeout), 60))
         self.forced_approval_tools = {"create_file", "apply_patch", "run_command"} if agent_mode == "safe" else set()
@@ -66,6 +70,7 @@ class ToolRegistry:
         if agent_mode == "autonomous":
             self.allowed_tools = set(self.available_names())
         self._handlers: dict[str, Callable[..., Any]] = {
+            "load_skill": self.load_skill,
             "list_files": self.list_files,
             "read_file": self.read_file,
             "search_text": self.search_text,
@@ -80,7 +85,22 @@ class ToolRegistry:
         return ["list_files", "read_file", "search_text", "create_file", "apply_patch", "run_command", "finish"]
 
     def schemas(self) -> list[dict[str, Any]]:
-        schemas = [
+        schemas: list[dict[str, Any]] = []
+        if self.skill_library:
+            schemas.append(_schema("load_skill", "按需读取已选 Skill 的完整操作说明。使用某项专门能力前先调用一次。", {
+                "skill_name": {
+                    "type": "string",
+                    "enum": sorted(self.skill_library),
+                    "description": "本轮已选 Skill 的内部名称",
+                },
+            }, required=["skill_name"]))
+        trace_property = {
+            "type": "array",
+            "items": {"type": "string", "enum": self.requirement_ids},
+            "uniqueItems": True,
+            "description": "本次操作直接服务的已确认验收项，例如 AC-01；有需求追踪时应填写",
+        }
+        schemas.extend([
             _schema("list_files", "列出工作区内的目录树。", {
                 "path": {"type": "string", "description": "相对工作区的目录，默认 ."},
                 "max_depth": {"type": "integer", "description": "递归深度，1 到 4，默认 3"},
@@ -89,6 +109,7 @@ class ToolRegistry:
                 "path": {"type": "string", "description": "相对文件路径"},
                 "start_line": {"type": "integer", "description": "起始行，默认 1"},
                 "end_line": {"type": "integer", "description": "结束行，最多读取 400 行"},
+                **({"requirement_ids": trace_property} if self.requirement_ids else {}),
             }, required=["path"]),
             _schema("search_text", "在工作区文本文件中搜索字符串。", {
                 "query": {"type": "string", "description": "要搜索的文本"},
@@ -97,23 +118,28 @@ class ToolRegistry:
             _schema("create_file", "在工作区内创建一个新的 UTF-8 文本文件；文件已存在时拒绝覆盖。", {
                 "path": {"type": "string", "description": "新文件的相对路径，可自动创建父目录"},
                 "content": {"type": "string", "description": "完整文件内容，最多 80000 个字符"},
+                **({"requirement_ids": trace_property} if self.requirement_ids else {}),
             }, required=["path", "content"]),
             _schema("apply_patch", "把文件中唯一匹配的 old_text 替换为 new_text，并返回 diff。", {
                 "path": {"type": "string", "description": "相对文件路径"},
                 "old_text": {"type": "string", "description": "文件中必须唯一出现的原文本"},
                 "new_text": {"type": "string", "description": "替换后的文本"},
+                **({"requirement_ids": trace_property} if self.requirement_ids else {}),
             }, required=["path", "old_text", "new_text"]),
             _schema("run_command", "在工作区运行一个受控的开发命令，不支持 shell 管道。", {
                 "command": {"type": "string", "description": "例如 pytest -q 或 npm test"},
                 "timeout": {"type": "integer", "description": f"超时秒数，1 到 {self.max_command_timeout}"},
+                **({"requirement_ids": trace_property} if self.requirement_ids else {}),
             }, required=["command"]),
             _schema("finish", "任务完成或无法继续时提交最终结果。", {
                 "summary": {"type": "string", "description": "面向用户的完成总结"},
                 "verification": {"type": "string", "description": "验证方式和结果"},
             }, required=["summary"]),
-        ]
+        ])
         for schema in schemas:
             name = schema["function"]["name"]
+            if name == "load_skill":
+                continue
             if name in self.blocked_tools:
                 schema["function"]["description"] += " 当前为只读模式，此工具已被禁止。"
             elif name in self.forced_approval_tools:
@@ -144,7 +170,7 @@ class ToolRegistry:
                 error="安全模式要求用户确认",
                 approval_required=True,
             )
-        if name not in self.allowed_tools and not approved:
+        if name != "load_skill" and name not in self.allowed_tools and not approved:
             return ToolResult(
                 False,
                 f"{name} 需要用户授权",
@@ -157,10 +183,12 @@ class ToolRegistry:
                 approval_required=True,
             )
         try:
+            execution_arguments = dict(arguments)
+            execution_arguments.pop("requirement_ids", None)
             if name == "run_command":
-                result = self.run_command(**arguments, approved=approved)
+                result = self.run_command(**execution_arguments, approved=approved)
             else:
-                result = self._handlers[name](**arguments)
+                result = self._handlers[name](**execution_arguments)
             if asyncio.iscoroutine(result):
                 result = await result
             return result
@@ -180,6 +208,21 @@ class ToolRegistry:
             return ToolResult(False, f"{name} 参数或权限检查失败", error=str(exc))
         except Exception as exc:  # Tool errors must become observations instead of crashing the loop.
             return ToolResult(False, f"{name} 执行失败", error=f"{type(exc).__name__}: {exc}")
+
+    def load_skill(self, skill_name: str) -> ToolResult:
+        skill = self.skill_library.get(skill_name)
+        if not skill:
+            raise ValueError("只能加载本轮已选择的 Skill")
+        return ToolResult(
+            True,
+            f"已加载 {skill.get('display_name', skill_name)} 的完整说明",
+            {
+                "skill_name": skill_name,
+                "display_name": skill.get("display_name", skill_name),
+                "description": skill.get("description", ""),
+                "instructions": skill.get("prompt", ""),
+            },
+        )
 
     def list_files(self, path: str = ".", max_depth: int = 3) -> ToolResult:
         directory = self.guard.resolve(path)

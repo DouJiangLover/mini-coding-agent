@@ -2,7 +2,7 @@
   "name": "frontend_build",
   "display_name": "Frontend Build Skill",
   "description": "从需求文档出发，在空工作区中规划、创建并验证一个完整的前端项目。",
-  "keywords": ["需求文档", "从零", "制作", "搭建", "新建项目", "小游戏", "2048", "前端页面", "小程序", "网站", "Web 应用", "build from requirements"],
+  "keywords": ["需求文档", "从零", "制作", "搭建", "新建项目", "小游戏", "2048", "网页", "前端页面", "小程序", "网站", "Web 应用", "Web 系统", "build from requirements"],
   "allowed_tools": ["list_files", "read_file", "search_text", "create_file", "apply_patch", "run_command", "finish"],
   "plan": [
     {"id": "inspect", "title": "读取需求与验收标准", "status": "running"},

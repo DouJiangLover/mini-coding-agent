@@ -1,4 +1,4 @@
-"""Small calculator used by the TraceCoder demo."""
+"""Small calculator used by the IntentFlow demo."""
 
 
 def add(a: float, b: float) -> float:

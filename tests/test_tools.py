@@ -130,3 +130,25 @@ def test_autonomous_mode_opens_safe_skill_outside_tools(tmp_path: Path):
 
     assert result.ok
     assert (tmp_path / "created.py").is_file()
+
+
+def test_skill_content_is_loaded_only_for_selected_skill(tmp_path: Path):
+    registry = ToolRegistry(
+        tmp_path,
+        allowed_tools=["read_file", "finish"],
+        skill_library={
+            "bug_fix": {
+                "display_name": "Bug Fix Skill",
+                "description": "修复测试失败",
+                "prompt": "先复现失败，再进行最小修改。",
+            },
+        },
+    )
+
+    loaded = asyncio.run(registry.execute("load_skill", {"skill_name": "bug_fix"}))
+    rejected = asyncio.run(registry.execute("load_skill", {"skill_name": "documentation"}))
+
+    assert loaded.ok
+    assert loaded.data["instructions"] == "先复现失败，再进行最小修改。"
+    assert not rejected.ok
+    assert "本轮已选择" in (rejected.error or "")
